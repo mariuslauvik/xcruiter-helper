@@ -1,4 +1,5 @@
 name: Poll Notion for ads
+# Polls every 5 minutes for jobs with status "Aktiv" in Stillinger.
 
 on:
   schedule:
