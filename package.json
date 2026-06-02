@@ -1,0 +1,16 @@
+{
+  "name": "xcruiter-helper",
+  "version": "0.1.0",
+  "description": "Xcruiter ad helper — Notion → Claude copy → GPT Image 2 → back to Notion",
+  "type": "module",
+  "scripts": {
+    "start": "node xcruiter-helper.mjs"
+  },
+  "license": "UNLICENSED",
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.100.1",
+    "@notionhq/client": "^5.22.0",
+    "dotenv": "^17.4.2",
+    "openai": "^6.41.0"
+  }
+}

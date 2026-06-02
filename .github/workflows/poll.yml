@@ -1,0 +1,23 @@
+name: Poll Notion for ads
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'  # kjør hvert 5. minutt
+  workflow_dispatch:        # gjør at vi kan trigge manuelt fra GitHub-UI-et
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      RUN_ONCE: 'true'
+      NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: npm ci
+      - run: npm start
