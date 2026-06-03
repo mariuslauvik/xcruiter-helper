@@ -50,6 +50,19 @@ const TYPE_TOKEN = {
   premium:   'Premium',
 };
 
+// Hvor og hvor stor logoen skal være per konsepttype. Posisjon beskriver hvor i
+// safe zone (y=285..1635) logoen lander; bredden er i prosent av annonsens bredde.
+// Disse verdiene styrer både compositing og prompten (sånn at GPT Image 2 lar
+// området være tomt).
+const LOGO_PLACEMENT = {
+  renTekst:  { posisjon: 'topp-senter',  bredeProsent: 22, beskrivelse: 'top-center as a bold brand statement' },
+  foto:      { posisjon: 'topp-venstre', bredeProsent: 12, beskrivelse: 'top-left corner, small and unobtrusive over the photo' },
+  fordeler:  { posisjon: 'topp-høyre',   bredeProsent: 10, beskrivelse: 'top-right corner, small accent mark' },
+  spørsmål:  { posisjon: 'bunn-senter',  bredeProsent: 16, beskrivelse: 'bottom-center, medium, like an editorial signoff' },
+  premium:   { posisjon: 'topp-senter',  bredeProsent: 14, beskrivelse: 'top-center, refined wordmark scale with generous whitespace below' },
+};
+const DEFAULT_LOGO_PLACEMENT = LOGO_PLACEMENT.foto;
+
 const COPY_MODEL = 'claude-sonnet-4-6'; // change if your account uses a different model string
 
 const OUTPUT_DIR = path.resolve('./output');
@@ -448,7 +461,7 @@ async function planFiveAds({ job, cust, assets, checklist }) {
 // ─────────────────────────────────────────────────────────────────────────────
 // Step 4 — bygg prompt PER konsept + realisme + logo-compositing (§ 5)
 // ─────────────────────────────────────────────────────────────────────────────
-function buildConceptPrompt(concept, { cust, job, checklist, willCompositeLogo }) {
+function buildConceptPrompt(concept, { cust, job, checklist, willCompositeLogo, logoPlacement }) {
   const fargerLinje = checklist.harFarger
     ? `background ${cust.primer}, body text ${cust.sekunder}, accents and CTA ${cust.aksent}`
     : 'neutral premium palette: soft warm dark background, off-white text, one tasteful accent color';
@@ -461,10 +474,10 @@ function buildConceptPrompt(concept, { cust, job, checklist, willCompositeLogo }
   const lokasjon = concept.bruk_lokasjon && job.sted ? job.sted : '';
   const rolleLinje = [ansettelsestype, lokasjon].filter(Boolean).join(' · ');
 
-  // Logo-håndtering: hvis vi vil compositere logo i etterkant, skal modellen LA
-  // det området være tomt. Hvis ikke, brukes ordmerket som tekst.
-  const logoBlock = willCompositeLogo
-    ? `LEAVE the top-left area of the safe zone clean and free of any text, logo or graphic (approx. x=0..400, y=285..420). The real customer logo will be composited on top in post-processing.`
+  // Logo-håndtering: hvis vi compositerer logo i etterkant, må modellen LA det
+  // valgte området være tomt — plassering og bredde varierer per konsepttype.
+  const logoBlock = willCompositeLogo && logoPlacement
+    ? `LEAVE CLEAN SPACE for the real logo (${logoPlacement.beskrivelse}, approximately ${logoPlacement.bredeProsent}% of width). Position: ${logoPlacement.posisjon}. Do NOT render any logo, wordmark, badge or graphic in that exact area — it will be composited on top in post-processing.`
     : `Render the wordmark "${cust.merke}" in ${cust.sekunder} uppercase ${cust.font || 'sans-serif'}-style letters at the top of the safe zone.`;
 
   // Sterk realisme-formulering KUN når vi må generere visuell.
@@ -540,20 +553,41 @@ ${exactTextParts.join(', ')}. No other text, no lorem ipsum, no extra words, no 
 Vertical 9:16 finished job ad; all text and CTA strictly inside safe zone y=285–1635; empty top and bottom strips; all Norwegian text correctly spelled with å and ø; publish-ready.`;
 }
 
-// Logo-compositing: legg ekte logo-PNG oppå det ferdige bildet (top-left i safe zone).
-// Sharp lastes lazily — kun nødvendig når vi faktisk skal komponere.
-async function compositeLogoOnAd(adBuffer, logoBuffer) {
+// Logo-compositing: legg ekte logo-PNG oppå det ferdige bildet. Posisjon og
+// størrelse varierer per konsepttype (LOGO_PLACEMENT). Safe zone er y=285..1635
+// (av 1920) — logoen skal alltid ligge innenfor.
+async function compositeLogoOnAd(adBuffer, logoBuffer, placement = DEFAULT_LOGO_PLACEMENT) {
   const { default: sharp } = await import('sharp');
   const adMeta = await sharp(adBuffer).metadata();
-  const logoWidth = Math.round((adMeta.width || 1088) * 0.13); // ~13 % av bredde
-  const resizedLogo = await sharp(logoBuffer)
-    .resize({ width: logoWidth, withoutEnlargement: false })
+  const adW = adMeta.width  || 1088;
+  const adH = adMeta.height || 1920;
+
+  const logoWidthTarget = Math.round(adW * (placement.bredeProsent / 100));
+  const resized = await sharp(logoBuffer)
+    .resize({ width: logoWidthTarget, withoutEnlargement: false })
     .png()
     .toBuffer();
-  const left = Math.round((adMeta.width || 1088) * 0.07);  // ~7 % venstre marg
-  const top  = Math.round((adMeta.height || 1920) * 0.17); // rett under topp safe-zone (285/1920 ≈ 0.149)
+  const resizedMeta = await sharp(resized).metadata();
+  const logoW = resizedMeta.width  || logoWidthTarget;
+  const logoH = resizedMeta.height || logoWidthTarget;
+
+  // Safe-zone-grenser i piksler (på 1920 høyde: y=285..1635).
+  const safeTop    = Math.round(adH * (285 / 1920));
+  const safeBottom = Math.round(adH * (1635 / 1920));
+  const sideMargin = Math.round(adW * 0.07);
+  const padding    = Math.round(adH * 0.02); // litt luft fra safe-zone-kanten
+
+  let top, left;
+  if (placement.posisjon.startsWith('topp'))      top = safeTop + padding;
+  else if (placement.posisjon.startsWith('bunn')) top = safeBottom - logoH - padding;
+  else /* midten */                                top = Math.round((adH - logoH) / 2);
+
+  if (placement.posisjon.endsWith('venstre'))      left = sideMargin;
+  else if (placement.posisjon.endsWith('høyre'))   left = adW - logoW - sideMargin;
+  else /* senter */                                 left = Math.round((adW - logoW) / 2);
+
   return await sharp(adBuffer)
-    .composite([{ input: resizedLogo, top, left }])
+    .composite([{ input: resized, left, top }])
     .png()
     .toBuffer();
 }
@@ -563,7 +597,8 @@ async function compositeLogoOnAd(adBuffer, logoBuffer) {
 // ─────────────────────────────────────────────────────────────────────────────
 async function generateOneAd({ concept, conceptIndex, job, cust, checklist, assets }) {
   const willCompositeLogo = !!(concept.bruk_logo && assets.logoFil?.buffer);
-  const prompt = buildConceptPrompt(concept, { cust, job, checklist, willCompositeLogo });
+  const logoPlacement = LOGO_PLACEMENT[concept.type] || DEFAULT_LOGO_PLACEMENT;
+  const prompt = buildConceptPrompt(concept, { cust, job, checklist, willCompositeLogo, logoPlacement });
 
   const common = { model: IMAGE_MODEL, prompt, size: IMAGE_SIZE, quality: IMAGE_QUALITY, n: 1 };
   let buffer;
@@ -585,11 +620,11 @@ async function generateOneAd({ concept, conceptIndex, job, cust, checklist, asse
 
   let logoComposited = false;
   if (willCompositeLogo) {
-    buffer = await compositeLogoOnAd(buffer, assets.logoFil.buffer);
+    buffer = await compositeLogoOnAd(buffer, assets.logoFil.buffer, logoPlacement);
     logoComposited = true;
   }
 
-  return { conceptIndex, concept, buffer, visualSource, logoComposited };
+  return { conceptIndex, concept, buffer, visualSource, logoComposited, logoPlacement: willCompositeLogo ? logoPlacement.posisjon : null };
 }
 
 async function generateFiveAds({ concepts, job, cust, checklist, assets }) {
@@ -599,7 +634,8 @@ async function generateFiveAds({ concepts, job, cust, checklist, assets }) {
   const tasks = concepts.map((concept, i) =>
     generateOneAd({ concept, conceptIndex: i, job, cust, checklist, assets })
       .then((ad) => {
-        console.log(`     ✓ ${i + 1}/${concepts.length} [${concept.type}] ${ad.visualSource}${ad.logoComposited ? ' + logo composited' : ''}`);
+        const logoNote = ad.logoComposited ? ` + logo composited (${ad.logoPlacement})` : '';
+        console.log(`     ✓ ${i + 1}/${concepts.length} [${concept.type}] ${ad.visualSource}${logoNote}`);
         return ad;
       })
   );
