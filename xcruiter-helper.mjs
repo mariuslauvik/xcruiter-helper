@@ -1,18 +1,24 @@
-// Xcruiter ad helper — v0.3 (5 distinkte annonser per kjøring)
+// Xcruiter ad helper — v0.4 (3 minimalistiske annonser per kjøring)
+//
+// Layout matcher executive recruitment-style samples (Maarud / Nasjonalarkivet / CAPUS):
+//   • Fargepanel topp (50%): logo + "Vi søker"-pill + stillingstittel + valgfri undertittel
+//   • Fullbredde ekte foto bunn (50%) — ingen CTA, ingen bullets, ingen URL.
 //
 // Flow:
 //   1. Finn første jobb i Stillinger med Status = "Levert".
-//   2. Les jobb + slå opp kunde (Kunde-relasjon eller navnematch på "Ditt firma").
+//   2. Les jobb (inkl. Nettsted og Brand farger) + slå opp kunde.
 //      Les ALLE filer i jobbens "Bilder til annonse" og kundens Bildebibliotek/Logo.
-//   3. analyzeAssets(): vision-analyse av alle opplastede bilder med Claude
-//      (claude-sonnet-4-6) — kategori, kvalitet, om de er brukbare som annonsebilde.
-//   4. buildChecklist(): regler fra data + analyse som styrer prompt-bygging.
-//   5. planFiveAds(): ett Claude-kall returnerer 5 distinkte konsepter
-//      (renTekst, foto, fordeler, spørsmål, premium — eller egne distinkte).
-//   6. generateFiveAds(): én GPT Image 2-genereringer per konsept (n=1).
-//      Ekte brukbart bilde → images.edit; ellers images.generate med realisme-prompt.
-//      Hvis logo finnes → sharp-compositing av logo på topp-venstre av safe zone.
-//   7. saveAds() lokalt + publishToNotion() fester alle 5 til "Annonser"
+//   3. scrapeWebsiteAssets() hvis Nettsted satt: HTTP-fetch + regex-parse for farger,
+//      font og bilder (HTML-statisk; SPA-sider faller tilbake til defaults).
+//   4. resolveBranding(): Kunde > Brand farger > Nettsted-skrap > defaults.
+//   5. analyzeAssets(): Claude vision per bilde (jobb + bibliotek + nettsted).
+//   6. buildChecklist(): boolean-flagg som styrer prompt.
+//   7. planThreeAds(): ett Claude-kall returnerer 3 varianter (samme template,
+//      ulikt foto + evt. liten undertittel-variasjon).
+//   8. generateThreeAds(): én GPT Image 2-genereringer per variant, parallelt.
+//      Ekte brukbart bilde → images.edit; ellers images.generate.
+//      Logo composites top-center via sharp (samme plassering på alle 3).
+//   9. saveAds() lokalt + publishToNotion() fester alle 3 til "Annonser"
 //      og setter status → "Annonse laget".
 //
 // Run:  node xcruiter-helper.mjs           (local poll loop, every 5 min)
@@ -42,26 +48,15 @@ const IMAGE_MODEL   = 'gpt-image-2';   // OpenAI GPT Image 2
 const IMAGE_SIZE    = '1088x1920';     // 9:16; width+height must be divisible by 16 (1080 is not)
 const IMAGE_QUALITY = 'high';          // low | medium | high
 
-const TYPE_TOKEN = {
-  renTekst:  'RenTekst',
-  foto:      'Foto',
-  fordeler:  'Fordeler',
-  spørsmål:  'Spørsmål',
-  premium:   'Premium',
-};
+// Filnavn-token er nå bare et indeksnummer (alle 3 varianter har samme template).
 
-// Hvor og hvor stor logoen skal være per konsepttype. Posisjon beskriver hvor i
-// safe zone (y=285..1635) logoen lander; bredden er i prosent av annonsens bredde.
-// Disse verdiene styrer både compositing og prompten (sånn at GPT Image 2 lar
-// området være tomt).
+// To-panel-template: logoen ligger i toppen av safe zone, sentrert. Samme
+// plassering på alle 3 varianter for konsistent merkeidentitet.
 const LOGO_PLACEMENT = {
-  renTekst:  { posisjon: 'topp-senter',  bredeProsent: 22, beskrivelse: 'top-center as a bold brand statement' },
-  foto:      { posisjon: 'topp-venstre', bredeProsent: 12, beskrivelse: 'top-left corner, small and unobtrusive over the photo' },
-  fordeler:  { posisjon: 'topp-høyre',   bredeProsent: 10, beskrivelse: 'top-right corner, small accent mark' },
-  spørsmål:  { posisjon: 'bunn-senter',  bredeProsent: 16, beskrivelse: 'bottom-center, medium, like an editorial signoff' },
-  premium:   { posisjon: 'topp-senter',  bredeProsent: 14, beskrivelse: 'top-center, refined wordmark scale with generous whitespace below' },
+  posisjon: 'topp-senter',
+  bredeProsent: 18,
+  beskrivelse: 'centered horizontally near the top of the colored panel',
 };
-const DEFAULT_LOGO_PLACEMENT = LOGO_PLACEMENT.foto;
 
 const COPY_MODEL = 'claude-sonnet-4-6'; // change if your account uses a different model string
 
@@ -192,8 +187,9 @@ async function readJobAndCustomer(jobPage) {
     vinkel:        txt(jp['Annonsevinkel']),
     beskrivelse:   txt(jp['Beskrivelse']),
     soknadslenke:  txt(jp['Søknadslenke']),
-    soknadsfrist:  txt(jp['Søknadsfrist']),       // NY (date)
-    brandFargerRaw:txt(jp['Brand farger']),       // NY: fallback fargekilde
+    soknadsfrist:  txt(jp['Søknadsfrist']),
+    brandFargerRaw:txt(jp['Brand farger']),       // tekst-fallback fargekilde
+    nettsted:      txt(jp['Nettsted']),           // URL — skrapes for branding/bilder hvis satt
     dittFirma:     txt(jp['Ditt firma']),
     kundeId:       firstRelationId(jp['Kunde']),
     jobbPhotoUrls,                                // NY: hele lista
@@ -210,26 +206,153 @@ async function readJobAndCustomer(jobPage) {
   }
 
   const cust = buildCustFromPage(custPage, job.dittFirma || 'Vår bedrift');
+  // Initial fargekilde-merking; resolveBranding kan overskrive med Nettsted-skrap.
+  cust.fargerKilde = cust.alle.length > 0 ? 'kundens Merkevarefarger' : 'ikke satt';
+  cust.fontKilde   = cust.font ? 'kundens Font' : 'ikke satt';
+  return { job, cust };
+}
 
-  // Fargekilde-presedens: kundens Merkevarefarger > stillingens Brand farger > defaults.
-  // parseColors leverer alltid defaults i primer/sekunder/aksent — vi sjekker `alle` for
-  // å se om kilden faktisk hadde hex-koder.
+// Setter sammen endelig branding-presedens. Kalles fra main() etter at både
+// Kunder-rad og evt. nettsted er hentet.
+function resolveBranding({ cust, job, scraped }) {
+  // Farger: Kunder-rad > stillingens "Brand farger" > skraped fra Nettsted > defaults
   if (cust.alle.length === 0 && job.brandFargerRaw) {
-    const jobbFarger = parseColors(job.brandFargerRaw);
-    if (jobbFarger.alle.length > 0) {
-      cust.alle     = jobbFarger.alle;
-      cust.primer   = jobbFarger.primer;
-      cust.sekunder = jobbFarger.sekunder;
-      cust.aksent   = jobbFarger.aksent;
+    const c = parseColors(job.brandFargerRaw);
+    if (c.alle.length > 0) {
+      cust.alle = c.alle; cust.primer = c.primer; cust.sekunder = c.sekunder; cust.aksent = c.aksent;
       cust.fargerKilde = 'stillingens "Brand farger"';
-    } else {
-      cust.fargerKilde = 'defaults';
     }
-  } else {
-    cust.fargerKilde = cust.alle.length > 0 ? 'kundens Merkevarefarger' : 'defaults';
+  }
+  if (cust.alle.length === 0 && scraped?.colors?.length > 0) {
+    const c = parseColors(scraped.colors.join(' '));
+    cust.alle = c.alle; cust.primer = c.primer; cust.sekunder = c.sekunder; cust.aksent = c.aksent;
+    cust.fargerKilde = `nettsted (${scraped.url})`;
+  }
+  if (cust.alle.length === 0) cust.fargerKilde = 'defaults';
+
+  // Font: Kunder-rad > skraped > tom (downstream bruker sans-serif-fallback)
+  if (!cust.font && scraped?.font) {
+    cust.font = scraped.font;
+    cust.fontKilde = `nettsted (${scraped.url})`;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Step 2a — skrap branding fra Nettsted (§ B)
+// HTTP-fetch + regex-parse for farger, font og bilder. Lett-vekt: ingen
+// headless browser, ingen ny dependency. SPA-sider faller tilbake til defaults.
+// ─────────────────────────────────────────────────────────────────────────────
+function hexFromColorString(s) {
+  if (!s) return null;
+  s = String(s).trim().toLowerCase();
+  if (/^#[0-9a-f]{6}$/.test(s)) return s;
+  if (/^#[0-9a-f]{3}$/.test(s)) return '#' + s.slice(1).split('').map((c) => c + c).join('');
+  if (/^#[0-9a-f]{8}$/.test(s)) return s.slice(0, 7); // dropp alpha
+  const rgb = s.match(/^rgba?\(\s*(\d+)[,\s]+(\d+)[,\s]+(\d+)/);
+  if (rgb) return '#' + [rgb[1], rgb[2], rgb[3]].map((n) => parseInt(n).toString(16).padStart(2, '0')).join('');
+  return null;
+}
+
+function extractColorsFromHtml(html) {
+  const colors = new Set();
+  // <meta name="theme-color">
+  const themeMatch = html.match(/<meta[^>]+name=["']theme-color["'][^>]+content=["']([^"']+)["']/i);
+  const themeHex = themeMatch && hexFromColorString(themeMatch[1]);
+  if (themeHex) colors.add(themeHex);
+  // CSS custom properties — typiske brand-tokens
+  const cssVarRe = /--(?:primary|brand|color|accent|main|secondary|background|bg|text|fg|theme)[a-z0-9_-]*\s*:\s*([^;}\n]+)/gi;
+  for (const m of html.matchAll(cssVarRe)) {
+    const hex = hexFromColorString(m[1]);
+    if (hex) colors.add(hex);
+  }
+  // Hex-koder i <style>-blokker (samler første 5 unike)
+  const styleBlocks = [...html.matchAll(/<style[^>]*>([\s\S]*?)<\/style>/gi)].map((m) => m[1]).join('\n');
+  const hexInStyles = styleBlocks.match(/#[0-9a-f]{6}\b/gi) || [];
+  for (const h of hexInStyles.slice(0, 20)) {
+    const hex = hexFromColorString(h);
+    if (hex) colors.add(hex);
+    if (colors.size >= 8) break;
+  }
+  return [...colors].slice(0, 8);
+}
+
+function extractFontFromHtml(html) {
+  // Google Fonts-lenke er sterkeste signalet
+  const gfont = html.match(/fonts\.googleapis\.com\/css2?\?family=([^&"'>\s]+)/i);
+  if (gfont) return decodeURIComponent(gfont[1].replace(/\+/g, ' ').split(':')[0]);
+  // font-family-deklarasjoner — første konkrete navn
+  const ffRe = /font-family\s*:\s*['"]?([^'";}\n]+?)['"]?\s*[;}]/gi;
+  for (const m of html.matchAll(ffRe)) {
+    const first = m[1].split(',')[0].replace(/['"`]/g, '').trim();
+    if (!first) continue;
+    const lower = first.toLowerCase();
+    if (['inherit', 'initial', 'unset', 'sans-serif', 'serif', 'monospace', 'system-ui'].includes(lower)) continue;
+    if (lower.startsWith('var(')) continue;
+    return first;
+  }
+  return null;
+}
+
+function extractImageUrlsFromHtml(html, baseUrl) {
+  const urls = new Set();
+  // <img src=...> og data-src/srcset
+  const imgRe = /<img[^>]+(?:src|data-src)=["']([^"']+)["']/gi;
+  for (const m of html.matchAll(imgRe)) {
+    let src = m[1].trim();
+    if (!src || src.startsWith('data:')) continue;
+    if (/\.svg(?:\?|$)/i.test(src)) continue;
+    if (/\b(icon|logo|favicon|sprite|avatar|emoji)\b/i.test(src)) continue;
+    try { urls.add(new URL(src, baseUrl).toString()); } catch {}
+  }
+  // og:image fallback
+  const og = html.match(/<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i);
+  if (og) { try { urls.add(new URL(og[1], baseUrl).toString()); } catch {} }
+  return [...urls].slice(0, 12);
+}
+
+async function scrapeWebsiteAssets(rawUrl, opts = {}) {
+  const { maxImages = 3, minImageBytes = 30000 } = opts;
+  if (!rawUrl) return null;
+
+  let url;
+  try {
+    url = new URL(/^https?:\/\//i.test(rawUrl) ? rawUrl : `https://${rawUrl}`).toString();
+  } catch {
+    return { url: rawUrl, colors: [], font: null, images: [], feil: 'ugyldig URL' };
   }
 
-  return { job, cust };
+  let html;
+  try {
+    const res = await fetch(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (compatible; XcruiterAdHelper/0.4; +https://github.com/mariuslauvik/xcruiter-helper)',
+        Accept: 'text/html,application/xhtml+xml',
+      },
+      signal: AbortSignal.timeout(15000),
+      redirect: 'follow',
+    });
+    if (!res.ok) return { url, colors: [], font: null, images: [], feil: `HTTP ${res.status}` };
+    html = await res.text();
+  } catch (err) {
+    return { url, colors: [], font: null, images: [], feil: `fetch: ${err.message}` };
+  }
+
+  const colors = extractColorsFromHtml(html);
+  const font   = extractFontFromHtml(html);
+  const imageUrls = extractImageUrlsFromHtml(html, url);
+
+  // Last ned kandidater (filtrer ut små filer som ofte er ikoner/sprites).
+  const images = [];
+  for (const u of imageUrls) {
+    if (images.length >= maxImages) break;
+    try {
+      const { buffer, mediaType } = await fetchImageAsBuffer(u);
+      if (buffer.length < minImageBytes) continue;
+      images.push({ url: u, buffer, mediaType, source: 'nettsted' });
+    } catch { /* hopp over */ }
+  }
+
+  return { url, colors, font, images, feil: null };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -246,9 +369,8 @@ async function fetchImageAsBuffer(url) {
   return { buffer, mediaType };
 }
 
-async function analyzeOneImage(url, source) {
+async function analyzeImageData({ buffer, mediaType, url, source }) {
   try {
-    const { buffer, mediaType } = await fetchImageAsBuffer(url);
     const msg = await anthropic.messages.create({
       model: COPY_MODEL,
       max_tokens: 300,
@@ -272,6 +394,15 @@ async function analyzeOneImage(url, source) {
   }
 }
 
+async function analyzeOneImage(url, source) {
+  try {
+    const { buffer, mediaType } = await fetchImageAsBuffer(url);
+    return await analyzeImageData({ buffer, mediaType, url, source });
+  } catch (err) {
+    return { url, source, buffer: null, mediaType: null, analyse: null, feil: err.message };
+  }
+}
+
 async function loadLogoOnly(url) {
   // Logo-kolonnen er per definisjon en logo — vi trenger bare bytene til § 5
   // (compositing). Vision-analyse hoppes over for å spare et Claude-kall.
@@ -287,11 +418,12 @@ async function loadLogoOnly(url) {
   }
 }
 
-async function analyzeAssets({ job, cust }) {
-  // Bilder fra jobb + bibliotek analyseres med vision; logo lastes bare ned.
+async function analyzeAssets({ job, cust, scrapedImages = [] }) {
+  // Bilder fra jobb + bibliotek + nettsted analyseres med vision; logo lastes bare ned.
   const visionTasks = [
     ...job.jobbPhotoUrls.map((u) => analyzeOneImage(u, 'jobb')),
     ...cust.bildebibliotekUrls.map((u) => analyzeOneImage(u, 'bibliotek')),
+    ...scrapedImages.map((img) => analyzeImageData({ buffer: img.buffer, mediaType: img.mediaType, url: img.url, source: 'nettsted' })),
   ];
   const logoTasks = cust.logoUrls.map(loadLogoOnly);
   const [analyserte, logoer] = await Promise.all([
@@ -362,31 +494,34 @@ function buildChecklist({ job, cust, assets }) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Step 3 — planlegg 5 distinkte annonse-konsepter (§ 4)
+// Step 3 — planlegg 3 annonse-varianter (§ D)
+// Fast minimalistisk template (matcher Maarud/Nasjonalarkivet/CAPUS-samples).
+// Variasjon: ulikt foto per ad, og evt. liten undertittel-variasjon.
 // ─────────────────────────────────────────────────────────────────────────────
-async function planFiveAds({ job, cust, assets, checklist }) {
-  // Index over brukbare ekte bilder så Claude kan referere via bilde_indeks.
+const AD_COUNT = 3;
+
+async function planThreeAds({ job, cust, assets, checklist }) {
   const bildeKatalog = assets.brukbareEkteBilder.length === 0
-    ? '  (ingen brukbare ekte bilder — konsepter må enten være ren tekst eller generere visuell)'
+    ? '  (ingen brukbare ekte bilder — alle 3 må generere realistisk arbeidsplass-foto)'
     : assets.brukbareEkteBilder.map((b, i) =>
         `  [${i}] kilde=${b.source}, type=${b.analyse?.type}, kvalitet=${b.analyse?.kvalitet}, hva="${b.analyse?.hva}"`
       ).join('\n');
 
   const fargerLinje = checklist.harFarger
     ? `primær=${cust.primer}, sekundær=${cust.sekunder}, aksent=${cust.aksent}`
-    : 'mangler — bruk nøytral premium-palett';
+    : '(mangler — bruk nøytral premium-palett)';
 
   const system =
-    'Du er en norsk reklametekstforfatter og art director som planlegger fem distinkte ' +
-    'stillingsannonse-konsepter for SAMME stilling. Mål: maksimal diversitet for Meta Andromeda. ' +
-    'Skriv kort, menneskelig norsk. Ingen AI-klisjeer, ingen "spennende muligheter"-floskler, ingen ' +
-    'rule-of-three, ingen em-dash-spam. Folk søker en bedre hverdag. Korrekt å og ø overalt. ' +
-    'Forstå beskrivelsen først (primærkilden), så vinkelen. ' +
+    'Du er en norsk reklametekstforfatter for stillingsannonser. Du planlegger 3 ' +
+    'varianter av SAMME annonse i en fast minimalistisk template (fargepanel topp med ' +
+    '"Vi søker"-pill + stillingstittel + valgfri undertittel + logo, fullbredde ekte foto ' +
+    'i bunnen — ingen CTA, ingen punktliste, ingen URL). Variasjon skjer kun gjennom ' +
+    'foto-valg og evt. en liten undertittel. ' +
+    'Hovedtittelen er stillingstittel — endre den ikke. Korrekt å og ø overalt. ' +
     'Svar KUN med rå JSON-array, ingen markdown, ingen forklaring.';
 
   const user =
     `MERKE: ${cust.merke}\n` +
-    `STEMME: ${cust.stemme || '(ikke satt)'}\n` +
     `FARGER: ${fargerLinje}\n` +
     `LOGO TILGJENGELIG: ${checklist.harLogo ? 'ja' : 'nei'}\n` +
     `\n` +
@@ -394,169 +529,135 @@ async function planFiveAds({ job, cust, assets, checklist }) {
     `ANSETTELSESTYPE: ${job.type || '(ikke satt)'}\n` +
     `LOKASJON: ${job.sted || '(ikke satt)'}\n` +
     `VINKEL: ${job.vinkel || '(ikke satt)'}\n` +
-    `BESKRIVELSE (primærkilde — forstå denne først): ${job.beskrivelse || '(ikke satt)'}\n` +
+    `BESKRIVELSE: ${job.beskrivelse || '(ikke satt)'}\n` +
     `\n` +
     `BRUKBARE EKTE BILDER (referer med bilde_indeks):\n${bildeKatalog}\n` +
     `\n` +
-    `OPPGAVE: Lag NØYAKTIG 5 distinkte konsepter for denne stillingen.\n` +
+    `OPPGAVE: Lag NØYAKTIG ${AD_COUNT} varianter av annonsen.\n` +
     `\n` +
-    `KONSEPT 1 MÅ være type "renTekst": typografisk, minimalt, ingen/lite foto, ` +
-    `logo hvis tilgjengelig, merkefarger. Ikke fancy.\n` +
-    `KONSEPT 2–5: fire helt ulike retninger. Anbefalte typer (du kan designe egne så lenge de er distinkte):\n` +
-    `  - "foto": stort ekte bilde av person/arbeidsplass, hook over\n` +
-    `  - "fordeler": punktene som helten, typografisk\n` +
-    `  - "spørsmål": direkte spørsmål-hook til kandidaten (f.eks. "Lei av tilfeldig turnus?")\n` +
-    `  - "premium": stilrent merkefarge-drevet, sofistikert redaksjonelt\n` +
+    `REGLER:\n` +
+    `- "hovedtittel" SKAL være stillingstittel uendret: "${job.tittel}".\n` +
+    `- "undertittel" er valgfri (kort linje under tittel, f.eks. ansettelsestype + lokasjon, ` +
+    `vinkel kort uttrykt, eller tom). Maks 40 tegn. Hold den menneskelig og konkret — ` +
+    `unngå floskler.\n` +
+    `- Foretrekk ekte bilder. Hvis det finnes ${AD_COUNT} eller flere brukbare bilder, ` +
+    `bruk ULIKT bilde per variant. Hvis færre finnes, kan flere varianter dele bilde — ` +
+    `da må undertittelen variere for å gi visuell forskjell.\n` +
+    `- Hvis ingen brukbare ekte bilder finnes, sett mode="generer" og beskriv kort ` +
+    `(generer_beskrivelse) en realistisk arbeidsplass-scene som matcher stillingen.\n` +
     `\n` +
-    `REGLER SOM MÅ OPPFYLLES på tvers av de 5 konseptene:\n` +
-    `- Ansettelsestype ${checklist.harAnsettelsestype ? `synlig i MINST ${checklist.regler.ansettelsestypeMinstAntall} konsepter (bruk_ansettelsestype:true)` : '— ikke tilgjengelig, sett bruk_ansettelsestype:false overalt'}.\n` +
-    `- Lokasjon ${checklist.harLokasjon ? `synlig i MINST ${checklist.regler.lokasjonMinstAntall} konsept (bruk_lokasjon:true)` : '— ikke tilgjengelig, sett bruk_lokasjon:false overalt'}.\n` +
-    `- Merkefarger brukes i ALLE konsepter (fargebruk-feltet beskriver hvordan).\n` +
-    `- Logo ${checklist.harLogo ? 'i ALLE konsepter (bruk_logo:true)' : 'mangler — sett bruk_logo:false; bruk merkenavnet som ordmerke i merkefont i stedet'}.\n` +
-    `- Foretrekk ekte bilder (visual.mode="bruk_bilde", med gyldig bilde_indeks) der konseptet passer; bruk "generer" KUN når ingen ekte bilde passer eller konseptet (f.eks. renTekst) ikke trenger foto.\n` +
-    `- Hver hook (hook_l1 + hook_l2) ≤ 72 tegn TOTALT. Punktene 2–4 ord hver.\n` +
-    `\n` +
-    `JSON-skjema per konsept:\n` +
+    `JSON-skjema per variant:\n` +
     `{\n` +
-    `  "type": "renTekst|foto|fordeler|spørsmål|premium",\n` +
-    `  "layout": "kort beskrivelse av oppsettet",\n` +
-    `  "hook_l1": "...", "hook_l2": "...", "hook_nokkelord": "ord fra hooken som skal ha aksentfarge",\n` +
-    `  "punkter": ["...", "...", "..."],\n` +
-    `  "visual": { "mode": "bruk_bilde|generer", "bilde_indeks": 0, "generer_beskrivelse": "<hvis generer: hva som skal genereres>" },\n` +
-    `  "bruk_logo": true|false,\n` +
-    `  "bruk_ansettelsestype": true|false,\n` +
-    `  "bruk_lokasjon": true|false,\n` +
-    `  "fargebruk": "hvordan primær/sekundær/aksent brukes i akkurat dette konseptet"\n` +
+    `  "hovedtittel": "${job.tittel}",\n` +
+    `  "undertittel": "<kort linje eller tom streng>",\n` +
+    `  "bilde": { "mode": "bruk_bilde|generer", "bilde_indeks": 0, "generer_beskrivelse": "<hvis generer>" }\n` +
     `}\n` +
     `\n` +
-    `Svar med JSON-array av nøyaktig 5 elementer; første element MÅ ha type "renTekst".`;
+    `Svar med JSON-array av nøyaktig ${AD_COUNT} elementer.`;
 
   const msg = await anthropic.messages.create({
     model: COPY_MODEL,
-    max_tokens: 2000,
+    max_tokens: 800,
     system,
     messages: [{ role: 'user', content: user }],
   });
   const raw = msg.content[0].text.trim().replace(/^```json\s*|\s*```$/g, '');
-  const concepts = JSON.parse(raw);
+  const variants = JSON.parse(raw);
 
-  if (!Array.isArray(concepts) || concepts.length !== 5) {
-    throw new Error(`planFiveAds: forventet array med 5 konsepter, fikk ${Array.isArray(concepts) ? concepts.length : typeof concepts}`);
+  if (!Array.isArray(variants) || variants.length !== AD_COUNT) {
+    throw new Error(`planThreeAds: forventet array med ${AD_COUNT} varianter, fikk ${Array.isArray(variants) ? variants.length : typeof variants}`);
   }
-  // Avled hook_hele + valider bilde-indeks
+  // Valider bilde-indeks og normaliser feltnavn
   const maxIndex = Math.max(0, assets.brukbareEkteBilder.length - 1);
-  for (const c of concepts) {
-    c.hook_hele = `${c.hook_l1 || ''} ${c.hook_l2 || ''}`.trim();
-    if (c.visual?.mode === 'bruk_bilde') {
-      const idx = c.visual.bilde_indeks ?? 0;
+  for (const v of variants) {
+    v.hovedtittel = v.hovedtittel || job.tittel;
+    v.undertittel = (v.undertittel || '').trim();
+    if (!v.bilde || typeof v.bilde !== 'object') {
+      v.bilde = { mode: 'generer', bilde_indeks: null, generer_beskrivelse: 'realistisk arbeidsplass-scene' };
+    }
+    if (v.bilde.mode === 'bruk_bilde') {
+      const idx = v.bilde.bilde_indeks ?? 0;
       if (assets.brukbareEkteBilder.length === 0 || idx > maxIndex || idx < 0) {
-        // Ugyldig referanse — degrader til generer.
-        c.visual = { mode: 'generer', bilde_indeks: null, generer_beskrivelse: c.visual.generer_beskrivelse || 'realistisk relevant scene' };
+        v.bilde = { mode: 'generer', bilde_indeks: null, generer_beskrivelse: v.bilde.generer_beskrivelse || 'realistisk arbeidsplass-scene' };
       }
     }
   }
-  return concepts;
+  return variants;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Step 4 — bygg prompt PER konsept + realisme + logo-compositing (§ 5)
+// Step 4 — bygg prompt for to-panel-template (§ E)
+// Fast layout matchende Maarud / Nasjonalarkivet / CAPUS:
+//   • Topp 50%: fargepanel med logo (composited) + "Vi søker"-pill + tittel
+//   • Bunn 50%: fullbredde ekte foto
+// Ingen CTA, ingen punktliste, ingen URL.
 // ─────────────────────────────────────────────────────────────────────────────
-function buildConceptPrompt(concept, { cust, job, checklist, willCompositeLogo, logoPlacement }) {
-  const fargerLinje = checklist.harFarger
-    ? `background ${cust.primer}, body text ${cust.sekunder}, accents and CTA ${cust.aksent}`
-    : 'neutral premium palette: soft warm dark background, off-white text, one tasteful accent color';
+function buildPrompt(variant, { cust, job, checklist, willCompositeLogo }) {
+  const fontName = cust.font || 'modern sans-serif';
+  const titleColor    = cust.sekunder;
+  const panelColor    = cust.primer;
+  const accentColor   = cust.aksent;
+  const usePalette    = checklist.harFarger;
 
-  const hookL1 = concept.hook_l1 || '';
-  const hookL2 = concept.hook_l2 || '';
-  const hookWhole = concept.hook_hele || `${hookL1} ${hookL2}`.trim();
-  const punkter = Array.isArray(concept.punkter) ? concept.punkter : [];
-  const ansettelsestype = concept.bruk_ansettelsestype && job.type ? job.type : '';
-  const lokasjon = concept.bruk_lokasjon && job.sted ? job.sted : '';
-  const rolleLinje = [ansettelsestype, lokasjon].filter(Boolean).join(' · ');
+  const hovedtittel   = variant.hovedtittel || job.tittel;
+  const undertittel   = (variant.undertittel || '').trim();
 
-  // Logo-håndtering: hvis vi compositerer logo i etterkant, må modellen LA det
-  // valgte området være tomt — plassering og bredde varierer per konsepttype.
-  const logoBlock = willCompositeLogo && logoPlacement
-    ? `LEAVE CLEAN SPACE for the real logo (${logoPlacement.beskrivelse}, approximately ${logoPlacement.bredeProsent}% of width). Position: ${logoPlacement.posisjon}. Do NOT render any logo, wordmark, badge or graphic in that exact area — it will be composited on top in post-processing.`
-    : `Render the wordmark "${cust.merke}" in ${cust.sekunder} uppercase ${cust.font || 'sans-serif'}-style letters at the top of the safe zone.`;
+  // Logo: ligger i topp-panelet, sentrert. Hvis vi compositerer i etterkant,
+  // ber vi modellen om å la et området stå tomt.
+  const logoBlock = willCompositeLogo
+    ? `LEAVE the top ~12% of the canvas (y=80 to y=300) CLEAN with no text, logo or graphic — only the panel background color. The real customer logo will be composited there in post-processing, ${LOGO_PLACEMENT.beskrivelse}, approximately ${LOGO_PLACEMENT.bredeProsent}% of width.`
+    : `At the top of the panel (centered horizontally, around y=180), render the wordmark "${cust.merke}" in ${titleColor} uppercase ${fontName} letters, approximately ${LOGO_PLACEMENT.bredeProsent}% of the canvas width.`;
 
-  // Sterk realisme-formulering KUN når vi må generere visuell.
-  const realismBlock = concept.visual?.mode === 'generer'
-    ? `REALISM CRITICAL — generated imagery MUST look like a real candid photograph: shot on a real camera with a real lens (35–50mm), natural directional daylight, real skin texture with visible pores, fine lines and small imperfections (never plastic-smooth, never waxy, never glossy CG sheen), asymmetrical natural features, relaxed unposed expression, anatomically correct hands with EXACTLY five fingers, natural teeth and eyes with subtle imperfections, real worn clothing with creases, slight film grain. STRICTLY FORBIDDEN: waxy or plastic skin, perfect facial symmetry, HDR glow, extra or missing fingers, mannequin/CGI look, airbrushed magazine retouching, AI-perfect features.`
+  // Visuell blokk for bunn-panelet
+  const realismBlock = variant.bilde?.mode === 'generer'
+    ? ` Photo MUST look like a real candid documentary photograph: shot on a real camera with a 35–50mm lens, natural directional daylight, real skin texture with visible pores and fine lines, asymmetrical natural features, relaxed unposed expression, anatomically correct hands with five fingers, natural teeth and eyes, real worn clothing with creases, slight film grain. FORBIDDEN: waxy or plastic skin, perfect symmetry, HDR glow, extra or missing fingers, mannequin/CGI look, airbrushed retouching, AI-perfect features, glossy CG sheen.`
     : '';
 
-  // Layout pr konsepttype
-  let layoutBlock;
-  switch (concept.type) {
-    case 'renTekst':
-      layoutBlock =
-`LAYOUT — PURE TYPOGRAPHY (concept 1, "renTekst"): no photograph. The composition is entirely typography on flat brand color. Background is ${cust.primer}. Hook in two large lines in ${cust.font || 'sans-serif'}-style, ${cust.sekunder}, with the keyword "${concept.hook_nokkelord || ''}" in ${cust.aksent}. ${rolleLinje ? `Below the hook, a small role line in ${cust.sekunder}: ${rolleLinje}.` : ''} Three short bullet points (each with a small ${cust.aksent} dot) in ${cust.sekunder}: ${punkter.join(' / ')}. Solid ${cust.aksent} rounded CTA button with ${cust.sekunder} uppercase "SØK NÅ" text and small ${cust.sekunder} URL "${cust.url}". Strict, editorial, minimal decoration.`;
-      break;
-    case 'foto':
-      layoutBlock =
-`LAYOUT — PHOTO-DOMINANT ("foto"): a large real photograph fills the upper ~60% of the safe zone, framed with softly rounded corners. Hook sits over the photo in a dark gradient strip at the bottom of the photo block, in ${cust.sekunder} with "${concept.hook_nokkelord || ''}" in ${cust.aksent}. ${rolleLinje ? `Role line "${rolleLinje}" below the photo.` : ''} Below: three small bullets in ${cust.sekunder} (${punkter.join(' / ')}), then the ${cust.aksent} CTA button "SØK NÅ" with URL ${cust.url}. The photo is the star.`;
-      break;
-    case 'fordeler':
-      layoutBlock =
-`LAYOUT — BENEFITS HERO ("fordeler"): the three bullet points are the biggest typographic elements, treated as stacked color bands or oversized number-cards (01, 02, 03 in ${cust.aksent}). Bullets: ${punkter.join(' / ')}. Hook above as a short headline in ${cust.font || 'sans-serif'}-style. ${rolleLinje ? `Small role line: ${rolleLinje}.` : ''} CTA at bottom (${cust.aksent} solid, "SØK NÅ", URL ${cust.url}). Mostly typographic — minimal or no photo.`;
-      break;
-    case 'spørsmål':
-      layoutBlock =
-`LAYOUT — QUESTION HOOK ("spørsmål"): top half is a large two-line question directly addressing the candidate, set in ${cust.font || 'sans-serif'}-style ${cust.sekunder} on ${cust.primer}, with the key word "${concept.hook_nokkelord || ''}" in ${cust.aksent}. Bottom half: smaller framed image (real photo if available), bullets ${punkter.join(' / ')}, ${rolleLinje ? `role line ${rolleLinje},` : ''} and CTA button "SØK NÅ" with URL ${cust.url}.`;
-      break;
-    case 'premium':
-      layoutBlock =
-`LAYOUT — PREMIUM EDITORIAL ("premium"): refined magazine-feature style. Generous whitespace, hook set in small-caps ${cust.font || 'serif'}-style, ${cust.sekunder} on ${cust.primer}. Thin ${cust.aksent} dividers between sections. Bullets ${punkter.join(' / ')} treated as elegant lead-in lines, not dot points. ${rolleLinje ? `Small role line: ${rolleLinje}.` : ''} Subtle ${cust.aksent} CTA "SØK NÅ" with URL ${cust.url}. Sophisticated, never loud.`;
-      break;
-    default:
-      layoutBlock = `LAYOUT (${concept.type}): ${concept.layout || 'vertical editorial recruitment ad layout matching the concept brief'}.`;
-  }
+  const visualBlock = variant.bilde?.mode === 'bruk_bilde'
+    ? `USE the provided photograph for the bottom half, kept REAL and UNALTERED. Crop/scale it to fill the entire bottom half edge-to-edge while keeping the main subject(s) centered. Do not re-render the people or scene. No borders, no rounded corners, no filters.`
+    : `Generate a real candid workplace photograph for the bottom half: ${variant.bilde?.generer_beskrivelse || `a relevant scene for the role "${hovedtittel}"`}.${realismBlock}`;
 
-  // Visuell blokk — bruk eksisterende ekte bilde, eller generer.
-  const visualBlock = concept.visual?.mode === 'bruk_bilde'
-    ? `VISUAL: USE the provided photograph as the hero image — keep it real and UNALTERED. Build the design around it. Do not re-render or modify the person/scene.`
-    : `VISUAL: ${concept.visual?.generer_beskrivelse || 'a realistic relevant scene supporting the headline'}.\n\n${realismBlock}`;
-
-  // Tving brand-farger-bruk
-  const fargebrukLine = concept.fargebruk ? `Brand color application for this concept: ${concept.fargebruk}.` : '';
+  const undertittelBlock = undertittel
+    ? `\n  4. A small subtitle directly below the title in ${titleColor} (lighter weight, single line): "${undertittel}".`
+    : '';
 
   // Tekst som MÅ gjengis bokstavelig
   const exactTextParts = [
     ...(willCompositeLogo ? [] : [cust.merke]),
-    'VI SØKER',
-    hookWhole,
-    ...(rolleLinje ? [rolleLinje] : []),
-    ...punkter,
-    'SØK NÅ',
-    ...(cust.url ? [cust.url] : []),
-  ].filter(Boolean);
+    'Vi søker',
+    hovedtittel,
+    ...(undertittel ? [undertittel] : []),
+  ];
 
-  return `A complete, finished vertical recruitment job advertisement (Norwegian stillingsannonse),
-9:16 format, 1088x1920, fully designed and publish-ready with text, layout and branding baked in.
-Premium editorial poster, on-brand for ${cust.merke}.
-CONCEPT TYPE: ${concept.type}.
+  return `A finished vertical recruitment job advertisement (Norwegian stillingsannonse),
+9:16 format, 1088x1920, fully designed and publish-ready for ${cust.merke}.
+Minimal, premium executive recruitment poster style — clean, restrained, on-brand.
 
-${layoutBlock}
+STRICT TWO-PANEL LAYOUT (50/50 split — single crisp horizontal seam at y=960):
 
-${visualBlock}
+TOP PANEL (y=0 to y=960): SOLID ${panelColor} background, no gradient, no texture, no photo. Contains:
+  1. ${logoBlock}
+  2. Below the logo area, around y=420, a small rounded pill/badge centered horizontally containing the small text "Vi søker" in ${titleColor}. The pill has a thin ${titleColor} outline OR a subtle ${usePalette ? `${accentColor} or ${titleColor}` : 'tasteful'} fill. Small caps NOT required — sentence case "Vi søker" is correct.
+  3. Below the pill, around y=550 to y=820, the JOB TITLE in very large bold ${fontName} letters, ${titleColor}, centered horizontally, 1–2 lines max: "${hovedtittel}".${undertittelBlock}
 
-${logoBlock}
+BOTTOM PANEL (y=960 to y=1920): FULL-BLEED real photograph, edge to edge, no borders, no rounded corners. ${visualBlock}
 
-COLORS: ${fargerLinje}. ${fargebrukLine}
-TONE: ${cust.stemme || 'warm, direct, honest — no clichés, no corporate fluff'}.
+NO CTA BUTTON, NO BULLET POINTS, NO URL, NO QR CODE, NO EXTRA GRAPHICS.
 
-SAFE ZONE (critical): keep ALL text, the CTA button, the wordmark/logo area, and the focal subject within the centered safe area between y=285 and y=1635. The top strip (y=0–285) and the bottom strip (y=1635–1920) must contain ONLY background and atmosphere — never text, button or logo. The "SØK NÅ" button sits well inside the safe zone, never near the bottom edge (Meta's UI covers the lowest ~20%).
+COLORS: ${usePalette ? `panel background ${panelColor}, all text and pill outline ${titleColor}, optional accent ${accentColor}` : 'neutral premium palette — dark warm panel, off-white text'}.
+TYPOGRAPHY: ${fontName} family for the title; refined, confident, executive recruitment aesthetic.
+TONE: ${cust.stemme || 'professional, warm, restrained — no clichés'}.
 
 CRITICAL — render this text EXACTLY and spelled correctly, including å and ø:
-${exactTextParts.join(', ')}. No other text, no lorem ipsum, no extra words, no watermark, no misspellings.
+${exactTextParts.join(', ')}. No other text, no lorem ipsum, no extra words, no watermark, no captions, no misspellings.
 
-Vertical 9:16 finished job ad; all text and CTA strictly inside safe zone y=285–1635; empty top and bottom strips; all Norwegian text correctly spelled with å and ø; publish-ready.`;
+Repeat: minimal two-panel poster, strict 50/50 horizontal split at y=960, ${panelColor} top panel with the title and pill, full-bleed real photo on the bottom, NO buttons or bullets, all Norwegian text correctly spelled with å and ø.`;
 }
 
 // Logo-compositing: legg ekte logo-PNG oppå det ferdige bildet. Posisjon og
 // størrelse varierer per konsepttype (LOGO_PLACEMENT). Safe zone er y=285..1635
 // (av 1920) — logoen skal alltid ligge innenfor.
-async function compositeLogoOnAd(adBuffer, logoBuffer, placement = DEFAULT_LOGO_PLACEMENT) {
+async function compositeLogoOnAd(adBuffer, logoBuffer, placement = LOGO_PLACEMENT) {
   const { default: sharp } = await import('sharp');
   const adMeta = await sharp(adBuffer).metadata();
   const adW = adMeta.width  || 1088;
@@ -593,25 +694,24 @@ async function compositeLogoOnAd(adBuffer, logoBuffer, placement = DEFAULT_LOGO_
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Step 5 — generer 5 annonser (én per konsept), n=1, komponere logo om mulig
+// Step 5 — generer 3 annonser (én per variant), n=1, composite logo
 // ─────────────────────────────────────────────────────────────────────────────
-async function generateOneAd({ concept, conceptIndex, job, cust, checklist, assets }) {
-  const willCompositeLogo = !!(concept.bruk_logo && assets.logoFil?.buffer);
-  const logoPlacement = LOGO_PLACEMENT[concept.type] || DEFAULT_LOGO_PLACEMENT;
-  const prompt = buildConceptPrompt(concept, { cust, job, checklist, willCompositeLogo, logoPlacement });
+async function generateOneAd({ variant, variantIndex, job, cust, checklist, assets }) {
+  const willCompositeLogo = !!(checklist.harLogo && assets.logoFil?.buffer);
+  const prompt = buildPrompt(variant, { cust, job, checklist, willCompositeLogo });
 
   const common = { model: IMAGE_MODEL, prompt, size: IMAGE_SIZE, quality: IMAGE_QUALITY, n: 1 };
   let buffer;
   let visualSource;
-  if (concept.visual?.mode === 'bruk_bilde' && assets.brukbareEkteBilder[concept.visual.bilde_indeks]) {
-    const photo = assets.brukbareEkteBilder[concept.visual.bilde_indeks];
+  if (variant.bilde?.mode === 'bruk_bilde' && assets.brukbareEkteBilder[variant.bilde.bilde_indeks]) {
+    const photo = assets.brukbareEkteBilder[variant.bilde.bilde_indeks];
     const ext = (photo.mediaType || 'image/png').split('/')[1] || 'png';
     const resp = await openai.images.edit({
       ...common,
       image: await toFile(photo.buffer, `reference.${ext}`, { type: photo.mediaType || 'image/png' }),
     });
     buffer = Buffer.from(resp.data[0].b64_json, 'base64');
-    visualSource = `bilde[${concept.visual.bilde_indeks}] (${photo.source})`;
+    visualSource = `bilde[${variant.bilde.bilde_indeks}] (${photo.source})`;
   } else {
     const resp = await openai.images.generate(common);
     buffer = Buffer.from(resp.data[0].b64_json, 'base64');
@@ -620,28 +720,26 @@ async function generateOneAd({ concept, conceptIndex, job, cust, checklist, asse
 
   let logoComposited = false;
   if (willCompositeLogo) {
-    buffer = await compositeLogoOnAd(buffer, assets.logoFil.buffer, logoPlacement);
+    buffer = await compositeLogoOnAd(buffer, assets.logoFil.buffer, LOGO_PLACEMENT);
     logoComposited = true;
   }
 
-  return { conceptIndex, concept, buffer, visualSource, logoComposited, logoPlacement: willCompositeLogo ? logoPlacement.posisjon : null };
+  return { variantIndex, variant, buffer, visualSource, logoComposited };
 }
 
-async function generateFiveAds({ concepts, job, cust, checklist, assets }) {
-  // Parallelt — totaltid ≈ tiden for den treigeste enkeltgenereringen.
-  // OBS: OpenAI Tier 1 har 5 images/min; treffer vi grensen kaster vi videre.
-  console.log(`   Starter ${concepts.length} parallelle GPT Image 2-kall...`);
-  const tasks = concepts.map((concept, i) =>
-    generateOneAd({ concept, conceptIndex: i, job, cust, checklist, assets })
+async function generateThreeAds({ variants, job, cust, checklist, assets }) {
+  console.log(`   Starter ${variants.length} parallelle GPT Image 2-kall...`);
+  const tasks = variants.map((variant, i) =>
+    generateOneAd({ variant, variantIndex: i, job, cust, checklist, assets })
       .then((ad) => {
-        const logoNote = ad.logoComposited ? ` + logo composited (${ad.logoPlacement})` : '';
-        console.log(`     ✓ ${i + 1}/${concepts.length} [${concept.type}] ${ad.visualSource}${logoNote}`);
+        const logoNote = ad.logoComposited ? ' + logo composited' : '';
+        const sub = ad.variant.undertittel ? ` "${ad.variant.undertittel}"` : '';
+        console.log(`     ✓ ${i + 1}/${variants.length}${sub} — ${ad.visualSource}${logoNote}`);
         return ad;
       })
   );
   const ads = await Promise.all(tasks);
-  // Bevar konseptrekkefølgen i utfilene (renTekst først osv.)
-  return ads.sort((a, b) => a.conceptIndex - b.conceptIndex);
+  return ads.sort((a, b) => a.variantIndex - b.variantIndex);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -658,11 +756,10 @@ function imageBaseName({ cust, job }) {
   return `${kode}-${rolle}-${vinkel}`;
 }
 function suffixFor(i) {
-  return String(i + 1).padStart(2, '0'); // 01, 02, ..., 05
+  return String(i + 1).padStart(2, '0'); // 01, 02, 03
 }
-function adFileName({ base, concept, index }) {
-  const typeToken = TYPE_TOKEN[concept.type] || 'Annonse';
-  return `${base}-${typeToken}-${suffixFor(index)}.png`;
+function adFileName({ base, index }) {
+  return `${base}-${suffixFor(index)}.png`;
 }
 
 async function saveAds(ads, { cust, job }) {
@@ -670,7 +767,7 @@ async function saveAds(ads, { cust, job }) {
   const base = imageBaseName({ cust, job });
   const files = [];
   for (let i = 0; i < ads.length; i++) {
-    const filename = adFileName({ base, concept: ads[i].concept, index: i });
+    const filename = adFileName({ base, index: i });
     const file = path.join(OUTPUT_DIR, filename);
     await fs.writeFile(file, ads[i].buffer);
     files.push(file);
@@ -682,7 +779,7 @@ async function publishToNotion(ads, { cust, job }) {
   const base = imageBaseName({ cust, job });
   const uploaded = [];
   for (let i = 0; i < ads.length; i++) {
-    const filename = adFileName({ base, concept: ads[i].concept, index: i });
+    const filename = adFileName({ base, index: i });
     const upload = await notion.fileUploads.create({
       filename,
       content_type: 'image/png',
@@ -720,16 +817,31 @@ async function main() {
   const { job, cust } = await readJobAndCustomer(jobPage);
   console.log(`→ ${cust.merke}: ${job.tittel} (${job.type} · ${job.sted})`);
   console.log(`   Branding-kilde: ${cust.kilde}`);
-  console.log(`   Fargekilde: ${cust.fargerKilde} (${cust.alle.length} hex)`);
-  console.log(`   Bilder: jobb=${job.jobbPhotoUrls.length}, bibliotek=${cust.bildebibliotekUrls.length}, logo=${cust.logoUrls.length}`);
 
-  const totalToAnalyze = job.jobbPhotoUrls.length + cust.bildebibliotekUrls.length;
+  // Nettsted-skraping for fallback-branding
+  let scraped = null;
+  if (job.nettsted) {
+    console.log(`→ Skraper nettsted: ${job.nettsted}...`);
+    scraped = await scrapeWebsiteAssets(job.nettsted);
+    if (scraped?.feil) {
+      console.log(`   ⚠ skraping feilet: ${scraped.feil}`);
+    } else if (scraped) {
+      console.log(`   ${scraped.colors.length} farge(r), ${scraped.images.length} bilde(r)${scraped.font ? `, font: ${scraped.font}` : ''}`);
+    }
+  }
+
+  resolveBranding({ cust, job, scraped });
+  console.log(`   Fargekilde: ${cust.fargerKilde} (${cust.alle.length} hex)`);
+  if (cust.font) console.log(`   Font: ${cust.font} (${cust.fontKilde})`);
+  console.log(`   Bilder: jobb=${job.jobbPhotoUrls.length}, bibliotek=${cust.bildebibliotekUrls.length}, nettsted=${scraped?.images.length ?? 0}, logo=${cust.logoUrls.length}`);
+
+  const totalToAnalyze = job.jobbPhotoUrls.length + cust.bildebibliotekUrls.length + (scraped?.images.length ?? 0);
   if (totalToAnalyze + cust.logoUrls.length > 0) {
     console.log(`→ Analyserer ${totalToAnalyze} bilde(r) med vision + henter ${cust.logoUrls.length} logo(er)...`);
   } else {
     console.log('→ Ingen opplastede bilder å analysere.');
   }
-  const assets = await analyzeAssets({ job, cust });
+  const assets = await analyzeAssets({ job, cust, scrapedImages: scraped?.images ?? [] });
   console.log(`   Brukbare ekte bilder: ${assets.brukbareEkteBilder.length} / ${totalToAnalyze}`);
   console.log(`   Logo funnet: ${assets.logoFil ? 'ja' : 'nei'}`);
   for (const a of assets.alle) {
@@ -744,15 +856,16 @@ async function main() {
   console.log(`→ Sjekkliste (ja): ${positiveFlags.join(', ') || '(ingen)'}`);
   console.log(`   Regler: ansettelsestype i ≥${checklist.regler.ansettelsestypeMinstAntall}, lokasjon i ≥${checklist.regler.lokasjonMinstAntall}, farger=${checklist.regler.fargerIAlle}, logo=${checklist.regler.logoIAlle}, ekte-bilde-prioritet=${checklist.regler.foretrekkEkteBildeOverGenerering}`);
 
-  console.log('→ Planlegger 5 konsepter med Claude...');
-  const concepts = await planFiveAds({ job, cust, assets, checklist });
-  concepts.forEach((c, i) => {
-    const visual = c.visual?.mode === 'bruk_bilde' ? `bilde[${c.visual.bilde_indeks}]` : 'generer';
-    console.log(`     ${i + 1}. [${c.type}] "${c.hook_hele}" — ${visual} — logo=${c.bruk_logo}`);
+  console.log(`→ Planlegger ${AD_COUNT} annonse-varianter med Claude...`);
+  const variants = await planThreeAds({ job, cust, assets, checklist });
+  variants.forEach((v, i) => {
+    const visual = v.bilde?.mode === 'bruk_bilde' ? `bilde[${v.bilde.bilde_indeks}]` : 'generer';
+    const sub = v.undertittel ? ` "${v.undertittel}"` : '';
+    console.log(`     ${i + 1}. ${visual}${sub}`);
   });
 
-  console.log(`→ Genererer ${concepts.length} annonser med GPT Image 2 (parallelt)...`);
-  const ads = await generateFiveAds({ concepts, job, cust, checklist, assets });
+  console.log(`→ Genererer ${variants.length} annonser med GPT Image 2 (parallelt)...`);
+  const ads = await generateThreeAds({ variants, job, cust, checklist, assets });
 
   const files = await saveAds(ads, { cust, job });
   console.log(`→ Saved ${files.length} ad(s) locally:`);
