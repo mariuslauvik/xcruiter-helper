@@ -293,32 +293,79 @@ function extractFontFromHtml(html) {
   return null;
 }
 
-function extractImageUrlsFromHtml(html, baseUrl) {
-  const urls = new Set();
-  // <img src=...> og data-src/srcset
-  const imgRe = /<img[^>]+(?:src|data-src)=["']([^"']+)["']/gi;
+// Plukker ut logo-kandidater: <img>-tags med "logo|mark|brand|wordmark", samt
+// apple-touch-icon/icon-meta-tags. Disse skal IKKE filtreres bort som content.
+function extractLogoUrlsFromHtml(html, baseUrl) {
+  const urls = [];
+  // <img> der src/alt/class/id antyder logo
+  const imgRe = /<img\b[^>]*>/gi;
   for (const m of html.matchAll(imgRe)) {
-    let src = m[1].trim();
+    const tag = m[0];
+    if (!/\b(logo|mark|brand|wordmark)\b/i.test(tag)) continue;
+    const src = (tag.match(/(?:^|\s)(?:src|data-src)=["']([^"']+)["']/i) || [])[1];
     if (!src || src.startsWith('data:')) continue;
-    if (/\.svg(?:\?|$)/i.test(src)) continue;
-    if (/\b(icon|logo|favicon|sprite|avatar|emoji)\b/i.test(src)) continue;
-    try { urls.add(new URL(src, baseUrl).toString()); } catch {}
+    try { urls.push(new URL(src, baseUrl).toString()); } catch {}
   }
-  // og:image fallback
+  // apple-touch-icon (oftest 180×180 PNG av merket)
+  for (const m of html.matchAll(/<link[^>]+rel=["']apple-touch-icon[^"']*["'][^>]+href=["']([^"']+)["']/gi)) {
+    try { urls.push(new URL(m[1], baseUrl).toString()); } catch {}
+  }
+  // <link rel="icon"> hvis png/jpg/webp (ikke .ico)
+  for (const m of html.matchAll(/<link[^>]+rel=["'](?:shortcut )?icon["'][^>]+href=["']([^"']+)["']/gi)) {
+    if (!/\.ico(\?|$)/i.test(m[1])) {
+      try { urls.push(new URL(m[1], baseUrl).toString()); } catch {}
+    }
+  }
+  return [...new Set(urls)];
+}
+
+// Plukker ut content-bilder (hero, scenes, products) — alt UNNTATT logo/icon/sprite.
+// Henter også fra srcset (største oppløsning) og inline background-image.
+function extractContentImageUrlsFromHtml(html, baseUrl) {
+  const urls = new Set();
+  const looksLikeAsset = (s) => /\b(logo|mark|brand|wordmark|icon|favicon|sprite|avatar|emoji|spinner|loader)\b/i.test(s);
+  const skipExt = (s) => /\.(svg|gif|ico)(\?|$)/i.test(s);
+
+  const imgRe = /<img\b[^>]*>/gi;
+  for (const m of html.matchAll(imgRe)) {
+    const tag = m[0];
+    if (looksLikeAsset(tag)) continue;
+    const src = (tag.match(/(?:^|\s)(?:src|data-src)=["']([^"']+)["']/i) || [])[1];
+    if (src && !src.startsWith('data:') && !skipExt(src)) {
+      try { urls.add(new URL(src, baseUrl).toString()); } catch {}
+    }
+    // srcset: pick largest descriptor (Wpx-w)
+    const srcset = (tag.match(/srcset=["']([^"']+)["']/i) || [])[1];
+    if (srcset) {
+      const parts = srcset.split(',').map((p) => p.trim().split(/\s+/));
+      const best = parts.sort((a, b) => parseInt(b[1] || '0') - parseInt(a[1] || '0'))[0]?.[0];
+      if (best && !best.startsWith('data:') && !skipExt(best)) {
+        try { urls.add(new URL(best, baseUrl).toString()); } catch {}
+      }
+    }
+  }
+  // background-image i inline-styles + <style>
+  for (const m of html.matchAll(/background(?:-image)?\s*:[^;}]*url\(\s*["']?([^)"']+)["']?\s*\)/gi)) {
+    const u = m[1];
+    if (u && !u.startsWith('data:') && !looksLikeAsset(u) && !skipExt(u)) {
+      try { urls.add(new URL(u, baseUrl).toString()); } catch {}
+    }
+  }
+  // og:image fallback (bra hero, men kan også være logo — vi bruker den)
   const og = html.match(/<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i);
   if (og) { try { urls.add(new URL(og[1], baseUrl).toString()); } catch {} }
-  return [...urls].slice(0, 12);
+  return [...urls].slice(0, 20);
 }
 
 async function scrapeWebsiteAssets(rawUrl, opts = {}) {
-  const { maxImages = 3, minImageBytes = 30000 } = opts;
+  const { maxImages = 3, minImageBytes = 20000 } = opts;
   if (!rawUrl) return null;
 
   let url;
   try {
     url = new URL(/^https?:\/\//i.test(rawUrl) ? rawUrl : `https://${rawUrl}`).toString();
   } catch {
-    return { url: rawUrl, colors: [], font: null, images: [], feil: 'ugyldig URL' };
+    return { url: rawUrl, colors: [], font: null, logoFile: null, images: [], feil: 'ugyldig URL' };
   }
 
   let html;
@@ -331,20 +378,34 @@ async function scrapeWebsiteAssets(rawUrl, opts = {}) {
       signal: AbortSignal.timeout(15000),
       redirect: 'follow',
     });
-    if (!res.ok) return { url, colors: [], font: null, images: [], feil: `HTTP ${res.status}` };
+    if (!res.ok) return { url, colors: [], font: null, logoFile: null, images: [], feil: `HTTP ${res.status}` };
     html = await res.text();
   } catch (err) {
-    return { url, colors: [], font: null, images: [], feil: `fetch: ${err.message}` };
+    return { url, colors: [], font: null, logoFile: null, images: [], feil: `fetch: ${err.message}` };
   }
 
   const colors = extractColorsFromHtml(html);
   const font   = extractFontFromHtml(html);
-  const imageUrls = extractImageUrlsFromHtml(html, url);
 
-  // Last ned kandidater (filtrer ut små filer som ofte er ikoner/sprites).
+  // Logo: prøv kandidatene i rekkefølge, returner første som lastes ned ok.
+  const logoUrls = extractLogoUrlsFromHtml(html, url);
+  let logoFile = null;
+  for (const u of logoUrls) {
+    try {
+      const { buffer, mediaType } = await fetchImageAsBuffer(u);
+      if (buffer.length < 1000) continue; // for liten — sannsynligvis tomme/feil
+      logoFile = { url: u, buffer, mediaType, source: 'nettsted-logo' };
+      break;
+    } catch { /* prøv neste */ }
+  }
+
+  // Content-bilder: last ned kandidater, filtrer ut små.
+  const contentUrls = extractContentImageUrlsFromHtml(html, url);
   const images = [];
-  for (const u of imageUrls) {
+  for (const u of contentUrls) {
     if (images.length >= maxImages) break;
+    // Ikke last ned logoen som content
+    if (logoFile && u === logoFile.url) continue;
     try {
       const { buffer, mediaType } = await fetchImageAsBuffer(u);
       if (buffer.length < minImageBytes) continue;
@@ -352,7 +413,7 @@ async function scrapeWebsiteAssets(rawUrl, opts = {}) {
     } catch { /* hopp over */ }
   }
 
-  return { url, colors, font, images, feil: null };
+  return { url, colors, font, logoFile, images, feil: null };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -418,7 +479,7 @@ async function loadLogoOnly(url) {
   }
 }
 
-async function analyzeAssets({ job, cust, scrapedImages = [] }) {
+async function analyzeAssets({ job, cust, scrapedImages = [], scrapedLogo = null }) {
   // Bilder fra jobb + bibliotek + nettsted analyseres med vision; logo lastes bare ned.
   const visionTasks = [
     ...job.jobbPhotoUrls.map((u) => analyzeOneImage(u, 'jobb')),
@@ -430,17 +491,28 @@ async function analyzeAssets({ job, cust, scrapedImages = [] }) {
     Promise.all(visionTasks),
     Promise.all(logoTasks),
   ]);
-  const alle = [...analyserte, ...logoer];
 
-  // Brukbare ekte bilder = vision sa OK OG ikke flagget som logo (logoer skal ikke
-  // brukes som hovedbilde i annonsen).
+  // Skrapet logo behandles som loadLogoOnly-resultat (allerede har bytene).
+  const scrapedLogoEntry = scrapedLogo
+    ? {
+        url: scrapedLogo.url, source: 'nettsted-logo',
+        buffer: scrapedLogo.buffer, mediaType: scrapedLogo.mediaType,
+        analyse: { type: 'logo', brukbar_som_annonsebilde: false, kvalitet: 'høy', hva: 'logo skraped fra nettsted', notat: 'apple-touch-icon / img med logo-hint' },
+        feil: null,
+      }
+    : null;
+
+  const alle = [...analyserte, ...logoer, ...(scrapedLogoEntry ? [scrapedLogoEntry] : [])];
+
+  // Brukbare ekte bilder = vision sa OK OG ikke flagget som logo.
   const brukbareEkteBilder = analyserte.filter(
     (r) => r.analyse?.brukbar_som_annonsebilde === true && r.analyse?.type !== 'logo'
   );
 
-  // Logo-kandidat: først eksplisitt Logo-kolonne, ellers vision som flagger 'logo'.
+  // Logo-kandidat: Logo-kolonne > nettsted-skrap > vision-flagget logo i andre bilder.
   const logoFil =
     logoer.find((r) => !r.feil) ??
+    scrapedLogoEntry ??
     analyserte.find((r) => r.analyse?.type === 'logo' && !r.feil) ??
     null;
 
@@ -826,22 +898,26 @@ async function main() {
     if (scraped?.feil) {
       console.log(`   ⚠ skraping feilet: ${scraped.feil}`);
     } else if (scraped) {
-      console.log(`   ${scraped.colors.length} farge(r), ${scraped.images.length} bilde(r)${scraped.font ? `, font: ${scraped.font}` : ''}`);
+      console.log(`   ${scraped.colors.length} farge(r), ${scraped.images.length} content-bilde(r), logo: ${scraped.logoFile ? 'ja' : 'nei'}${scraped.font ? `, font: ${scraped.font}` : ''}`);
     }
   }
 
   resolveBranding({ cust, job, scraped });
   console.log(`   Fargekilde: ${cust.fargerKilde} (${cust.alle.length} hex)`);
   if (cust.font) console.log(`   Font: ${cust.font} (${cust.fontKilde})`);
-  console.log(`   Bilder: jobb=${job.jobbPhotoUrls.length}, bibliotek=${cust.bildebibliotekUrls.length}, nettsted=${scraped?.images.length ?? 0}, logo=${cust.logoUrls.length}`);
+  console.log(`   Bilder: jobb=${job.jobbPhotoUrls.length}, bibliotek=${cust.bildebibliotekUrls.length}, nettsted=${scraped?.images.length ?? 0}, logo=${cust.logoUrls.length}${scraped?.logoFile ? ' + scraped' : ''}`);
 
   const totalToAnalyze = job.jobbPhotoUrls.length + cust.bildebibliotekUrls.length + (scraped?.images.length ?? 0);
-  if (totalToAnalyze + cust.logoUrls.length > 0) {
-    console.log(`→ Analyserer ${totalToAnalyze} bilde(r) med vision + henter ${cust.logoUrls.length} logo(er)...`);
+  if (totalToAnalyze + cust.logoUrls.length > 0 || scraped?.logoFile) {
+    console.log(`→ Analyserer ${totalToAnalyze} bilde(r) med vision + henter logo(er)...`);
   } else {
     console.log('→ Ingen opplastede bilder å analysere.');
   }
-  const assets = await analyzeAssets({ job, cust, scrapedImages: scraped?.images ?? [] });
+  const assets = await analyzeAssets({
+    job, cust,
+    scrapedImages: scraped?.images ?? [],
+    scrapedLogo:   scraped?.logoFile ?? null,
+  });
   console.log(`   Brukbare ekte bilder: ${assets.brukbareEkteBilder.length} / ${totalToAnalyze}`);
   console.log(`   Logo funnet: ${assets.logoFil ? 'ja' : 'nei'}`);
   for (const a of assets.alle) {
