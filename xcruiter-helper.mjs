@@ -593,15 +593,19 @@ async function generateOneAd({ concept, conceptIndex, job, cust, checklist, asse
 }
 
 async function generateFiveAds({ concepts, job, cust, checklist, assets }) {
-  // Sekvensielt for å unngå OpenAI rate-limits; alle 5 må lykkes.
-  const ads = [];
-  for (let i = 0; i < concepts.length; i++) {
-    console.log(`   • konsept ${i + 1}/${concepts.length} [${concepts[i].type}]...`);
-    const ad = await generateOneAd({ concept: concepts[i], conceptIndex: i, job, cust, checklist, assets });
-    console.log(`     ✓ ${ad.visualSource}${ad.logoComposited ? ' + logo composited' : ''}`);
-    ads.push(ad);
-  }
-  return ads;
+  // Parallelt — totaltid ≈ tiden for den treigeste enkeltgenereringen.
+  // OBS: OpenAI Tier 1 har 5 images/min; treffer vi grensen kaster vi videre.
+  console.log(`   Starter ${concepts.length} parallelle GPT Image 2-kall...`);
+  const tasks = concepts.map((concept, i) =>
+    generateOneAd({ concept, conceptIndex: i, job, cust, checklist, assets })
+      .then((ad) => {
+        console.log(`     ✓ ${i + 1}/${concepts.length} [${concept.type}] ${ad.visualSource}${ad.logoComposited ? ' + logo composited' : ''}`);
+        return ad;
+      })
+  );
+  const ads = await Promise.all(tasks);
+  // Bevar konseptrekkefølgen i utfilene (renTekst først osv.)
+  return ads.sort((a, b) => a.conceptIndex - b.conceptIndex);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -711,7 +715,7 @@ async function main() {
     console.log(`     ${i + 1}. [${c.type}] "${c.hook_hele}" — ${visual} — logo=${c.bruk_logo}`);
   });
 
-  console.log(`→ Genererer ${concepts.length} annonser med GPT Image 2 (sekvensielt)...`);
+  console.log(`→ Genererer ${concepts.length} annonser med GPT Image 2 (parallelt)...`);
   const ads = await generateFiveAds({ concepts, job, cust, checklist, assets });
 
   const files = await saveAds(ads, { cust, job });
