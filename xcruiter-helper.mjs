@@ -31,8 +31,8 @@ const STATUS_READY = 'Levert';
 const STATUS_DONE  = 'Annonse laget';
 const POLL_INTERVAL_MS = 5 * 60 * 1000; // sjekk Notion hvert 5. minutt (kun lokalt — GitHub Actions bruker RUN_ONCE)
 
-const NOTION_INPUT_PHOTO_COL  = 'Annonsebilder'; // kundens jobb-spesifikke bilde (på Stillinger)
-const NOTION_OUTPUT_FILE_COL  = 'Annonser';      // ferdige annonser legges her (på Stillinger)
+const NOTION_INPUT_PHOTO_COL  = 'Bilder til annonse'; // kundens jobb-spesifikke bilde (på Stillinger)
+const NOTION_OUTPUT_FILE_COL  = 'Annonser';            // ferdige annonser legges her (på Stillinger)
 
 const IMAGE_MODEL   = 'gpt-image-2';   // OpenAI GPT Image 2
 const IMAGE_SIZE    = '1088x1920';     // 9:16; width+height must be divisible by 16 (1080 is not)
@@ -85,14 +85,7 @@ const firstFileUrl = (p) => {
 async function findReadyJob() {
   const res = await notion.dataSources.query({
     data_source_id: STILLINGER_DS,
-    // Krev både Levert-status OG koblet Kunde — ellers er det ingenting å gjøre,
-    // og cron-jobben i Actions skal ikke krasje på dataf-problemer.
-    filter: {
-      and: [
-        { property: 'Status', select: { equals: STATUS_READY } },
-        { property: 'Kunde',  relation: { is_not_empty: true } },
-      ],
-    },
+    filter: { property: 'Status', select: { equals: STATUS_READY } },
     page_size: 1,
   });
   return res.results[0] ?? null;
@@ -110,34 +103,81 @@ function parseColors(s) {
   };
 }
 
-async function readJobAndCustomer(jobPage) {
-  const jp = jobPage.properties;
-  const job = {
-    pageId: jobPage.id,
-    tittel:     txt(jp['Stillingstittel']),
-    type:       txt(jp['Ansettelsestype']),
-    sted:       txt(jp['Lokasjon']),
-    vinkel:     txt(jp['Annonsevinkel']),
-    beskrivelse:txt(jp['Beskrivelse']),
-    soknadslenke: txt(jp['Søknadslenke']),
-    kundeId:    firstRelationId(jp['Kunde']),
-    jobbPhotoUrl: firstFileUrl(jp[NOTION_INPUT_PHOTO_COL]), // kundens job-specific upload
-  };
-  if (!job.kundeId) throw new Error(`Job "${job.tittel}" has no linked Kunde.`);
+async function findKundeRowByName(name) {
+  if (!name) return null;
+  const trimmed = name.trim();
+  if (!trimmed) return null;
+  // Title-eiendomsfilteret matcher delstrenger (case-insensitive), så vi henter
+  // kandidater og velger eksakt match først, ellers første treff.
+  const res = await notion.dataSources.query({
+    data_source_id: KUNDER_DS,
+    filter: { property: 'Bedriftsnavn', title: { contains: trimmed } },
+    page_size: 10,
+  });
+  const lower = trimmed.toLowerCase();
+  return (
+    res.results.find((r) =>
+      r.properties.Bedriftsnavn?.title?.[0]?.plain_text?.trim().toLowerCase() === lower
+    ) ??
+    res.results[0] ??
+    null
+  );
+}
 
-  const custPage = await notion.pages.retrieve({ page_id: job.kundeId });
+function buildCustFromPage(custPage, fallbackName) {
+  if (!custPage) {
+    // Ingen Kunder-rad funnet — bruk firmanavn fra skjemaet med default branding.
+    return {
+      merke:   fallbackName,
+      kode:    '',
+      font:    '',
+      stemme:  '',
+      url:     '',
+      ...parseColors(''), // gir defaults
+      bildebibliotekUrl: null,
+      logoUrl:           null,
+      kilde:   'fallback (ingen Kunder-rad matchet)',
+    };
+  }
   const cp = custPage.properties;
-  const colors = parseColors(txt(cp['Merkevarefarger']));
-  const cust = {
-    merke:   txt(cp['Bedriftsnavn']),
+  return {
+    merke:   txt(cp['Bedriftsnavn']) || fallbackName,
     kode:    txt(cp['Merkekode']),
     font:    txt(cp['Font']),
     stemme:  txt(cp['Merkevarestemme']),
     url:     txt(cp['Nettside']),
-    ...colors,
+    ...parseColors(txt(cp['Merkevarefarger'])),
     bildebibliotekUrl: firstFileUrl(cp['Bildebibliotek']),
     logoUrl:           firstFileUrl(cp['Logo']),
+    kilde:   `Kunder-rad (${txt(cp['Bedriftsnavn'])})`,
   };
+}
+
+async function readJobAndCustomer(jobPage) {
+  const jp = jobPage.properties;
+  const job = {
+    pageId: jobPage.id,
+    tittel:       txt(jp['Stillingstittel']),
+    type:         txt(jp['Ansettelsestype']),
+    sted:         txt(jp['Lokasjon']),
+    vinkel:       txt(jp['Annonsevinkel']),
+    beskrivelse:  txt(jp['Beskrivelse']),
+    soknadslenke: txt(jp['Søknadslenke']),
+    dittFirma:    txt(jp['Ditt firma']),
+    kundeId:      firstRelationId(jp['Kunde']),
+    jobbPhotoUrl: firstFileUrl(jp[NOTION_INPUT_PHOTO_COL]),
+  };
+
+  // Hent Kunder-rad — først via relasjonen hvis satt manuelt,
+  // ellers via navnematch på "Ditt firma".
+  let custPage = null;
+  if (job.kundeId) {
+    custPage = await notion.pages.retrieve({ page_id: job.kundeId });
+  } else if (job.dittFirma) {
+    custPage = await findKundeRowByName(job.dittFirma);
+  }
+
+  const cust = buildCustFromPage(custPage, job.dittFirma || 'Vår bedrift');
   return { job, cust };
 }
 
@@ -329,6 +369,7 @@ async function main() {
 
   const { job, cust } = await readJobAndCustomer(jobPage);
   console.log(`→ ${cust.merke}: ${job.tittel} (${job.type} · ${job.sted})`);
+  console.log(`   Branding-kilde: ${cust.kilde}`);
 
   console.log('→ Writing copy with Claude...');
   const copy = await writeCopy(job);
