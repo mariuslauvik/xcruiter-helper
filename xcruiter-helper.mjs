@@ -1,14 +1,18 @@
-// Xcruiter ad helper — v0.1
-// Flow: find a "Klar for annonse" job in Notion → read customer branding →
+// Xcruiter ad helper — v0.2
+// Flow: find a "Levert" job in Notion → read job + customer branding →
 // ask Claude for the ad copy → build the §8 prompt → generate with GPT Image 2
-// (OpenAI) → save images → set the job to "Annonse laget".
+// (OpenAI) → save images → upload to the job's "Annonser" field in Notion →
+// set the job to "Annonse laget".
 //
-// Run:  node xcruiter-helper.mjs
-// Needs a .env with NOTION_TOKEN, OPENAI_API_KEY, ANTHROPIC_API_KEY.
+// Hero photo precedence:
+//   LOCAL_PHOTO_PATH (test)
+//   → job's Annonsebilder (customer's job-specific upload)
+//   → customer's Bildebibliotek (brand-wide photos)
+//   → customer's Logo (last fallback)
+//   → generated from scratch.
 //
-// NOTE (read me): the API calls in here were written against the official SDK
-// signatures but NOT run end-to-end yet. Treat the first run as the test —
-// errors on the first pass are expected and easy to fix.
+// Run:  node xcruiter-helper.mjs           (local poll loop, every 5 min)
+//   or: RUN_ONCE=true node ...             (single pass — used by GitHub Actions cron)
 
 import 'dotenv/config';
 import fs from 'node:fs/promises';
@@ -23,9 +27,12 @@ import Anthropic from '@anthropic-ai/sdk';
 const STILLINGER_DS = 'c0a69668-b0c1-405c-a6df-b9464395abd6'; // Stillinger data source
 const KUNDER_DS      = '713cc956-67c6-4731-8441-3f5cbdc47e5c'; // Kunder data source (kept for reference)
 
-const STATUS_READY = 'Aktiv';
+const STATUS_READY = 'Levert';
 const STATUS_DONE  = 'Annonse laget';
-const POLL_INTERVAL_MS = 5 * 60 * 1000; // sjekk Notion hvert 5. minutt
+const POLL_INTERVAL_MS = 5 * 60 * 1000; // sjekk Notion hvert 5. minutt (kun lokalt — GitHub Actions bruker RUN_ONCE)
+
+const NOTION_INPUT_PHOTO_COL  = 'Annonsebilder'; // kundens jobb-spesifikke bilde (på Stillinger)
+const NOTION_OUTPUT_FILE_COL  = 'Annonser';      // ferdige annonser legges her (på Stillinger)
 
 const IMAGE_MODEL   = 'gpt-image-2';   // OpenAI GPT Image 2
 const IMAGE_SIZE    = '1088x1920';     // 9:16; width+height must be divisible by 16 (1080 is not)
@@ -107,6 +114,7 @@ async function readJobAndCustomer(jobPage) {
     beskrivelse:txt(jp['Beskrivelse']),
     soknadslenke: txt(jp['Søknadslenke']),
     kundeId:    firstRelationId(jp['Kunde']),
+    jobbPhotoUrl: firstFileUrl(jp[NOTION_INPUT_PHOTO_COL]), // kundens job-specific upload
   };
   if (!job.kundeId) throw new Error(`Job "${job.tittel}" has no linked Kunde.`);
 
@@ -120,8 +128,8 @@ async function readJobAndCustomer(jobPage) {
     stemme:  txt(cp['Merkevarestemme']),
     url:     txt(cp['Nettside']),
     ...colors,
-    // Bildebibliotek / Logo may or may not exist as a files property yet:
-    kundebildeUrl: firstFileUrl(cp['Bildebibliotek']) || firstFileUrl(cp['Logo']) || null,
+    bildebibliotekUrl: firstFileUrl(cp['Bildebibliotek']),
+    logoUrl:           firstFileUrl(cp['Logo']),
   };
   return { job, cust };
 }
@@ -204,12 +212,20 @@ all Norwegian text spelled exactly with correct å and ø; publish-ready.`;
 // ─────────────────────────────────────────────────────────────────────────────
 // Step 5 — generate with GPT Image 2 (edit if we have a hero photo, else generate)
 // ─────────────────────────────────────────────────────────────────────────────
-async function loadPhotoBuffer(cust) {
-  if (LOCAL_PHOTO_PATH) return await fs.readFile(LOCAL_PHOTO_PATH);
-  if (cust.kundebildeUrl) {
-    const res = await fetch(cust.kundebildeUrl); // Notion file URLs are temporary — fetch now
-    if (!res.ok) throw new Error(`Could not download customer image (${res.status})`);
-    return Buffer.from(await res.arrayBuffer());
+async function loadPhotoBuffer({ job, cust }) {
+  if (LOCAL_PHOTO_PATH) {
+    return { buffer: await fs.readFile(LOCAL_PHOTO_PATH), source: 'lokal testfil' };
+  }
+  const candidates = [
+    { url: job.jobbPhotoUrl,         source: `jobbens "${NOTION_INPUT_PHOTO_COL}"` },
+    { url: cust.bildebibliotekUrl,   source: 'kundens Bildebibliotek' },
+    { url: cust.logoUrl,             source: 'kundens Logo (fallback)' },
+  ];
+  for (const c of candidates) {
+    if (!c.url) continue;
+    const res = await fetch(c.url); // Notion-fil-URL-er er midlertidige — last ned nå
+    if (!res.ok) throw new Error(`Kunne ikke laste ned ${c.source} (${res.status})`);
+    return { buffer: Buffer.from(await res.arrayBuffer()), source: c.source };
   }
   return null;
 }
@@ -251,10 +267,8 @@ async function saveImages(buffers, { cust, job }) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Step 6b — last opp bildene tilbake i Notion (Stillinger → "Annonsebilder")
+// Step 6b — last opp bildene tilbake i Notion (Stillinger → "Annonser")
 // ─────────────────────────────────────────────────────────────────────────────
-const NOTION_FILE_COLUMN = 'Annonsebilder';
-
 async function uploadImagesToNotion(buffers, { cust, job }) {
   const base = imageBaseName({ cust, job });
   const uploaded = [];
@@ -276,7 +290,7 @@ async function uploadImagesToNotion(buffers, { cust, job }) {
   await notion.pages.update({
     page_id: job.pageId,
     properties: {
-      [NOTION_FILE_COLUMN]: {
+      [NOTION_OUTPUT_FILE_COL]: {
         files: uploaded.map((u) => ({
           name: u.name,
           type: 'file_upload',
@@ -313,19 +327,19 @@ async function main() {
   const copy = await writeCopy(job);
   console.log(`   hook: ${copy.hook_hele}`);
 
-  const photoBuffer = await loadPhotoBuffer(cust);
-  const hasPhoto = !!photoBuffer;
-  console.log(`→ Hero image: ${hasPhoto ? 'using real photo' : 'generating (no photo found)'}`);
+  const photo = await loadPhotoBuffer({ job, cust });
+  const hasPhoto = !!photo;
+  console.log(`→ Hero image: ${hasPhoto ? `using ${photo.source}` : 'generating (no photo found)'}`);
 
   const prompt = buildPrompt({ cust, job, copy, hasPhoto });
   console.log('→ Generating with GPT Image 2 (this takes a bit)...');
-  const buffers = await generateImages(prompt, photoBuffer);
+  const buffers = await generateImages(prompt, photo?.buffer ?? null);
 
   const files = await saveImages(buffers, { cust, job });
   console.log(`→ Saved ${files.length} image(s) locally:`);
   files.forEach((f) => console.log(`   ${f}`));
 
-  console.log(`→ Laster opp til Notion-egenskap "${NOTION_FILE_COLUMN}"...`);
+  console.log(`→ Laster opp til Notion-egenskap "${NOTION_OUTPUT_FILE_COL}"...`);
   const uploaded = await uploadImagesToNotion(buffers, { cust, job });
   console.log(`   ${uploaded} bilde(r) festet til jobben i Notion.`);
 
@@ -358,7 +372,7 @@ async function pollLoop() {
 if (process.env.RUN_ONCE === 'true') {
   (async () => {
     try {
-      // Tøm køen i én cron-fyring — hvis flere "Aktiv"-jobber, prosesser alle.
+      // Tøm køen i én cron-fyring — hvis flere "Levert"-jobber, prosesser alle.
       while (await main()) { /* fortsett */ }
     } catch (err) {
       console.error('✖ Feil:', err.message);
