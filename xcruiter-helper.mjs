@@ -242,6 +242,19 @@ function resolveBranding({ cust, job, scraped }) {
 // HTTP-fetch + regex-parse for farger, font og bilder. Lett-vekt: ingen
 // headless browser, ingen ny dependency. SPA-sider faller tilbake til defaults.
 // ─────────────────────────────────────────────────────────────────────────────
+function decodeHtmlEntities(s) {
+  if (!s) return s;
+  return s
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&#x2f;/gi, '/')
+    .replace(/&#(\d+);/g, (_, c) => String.fromCharCode(parseInt(c, 10)))
+    .replace(/&#x([0-9a-f]+);/gi, (_, c) => String.fromCharCode(parseInt(c, 16)));
+}
+
 function hexFromColorString(s) {
   if (!s) return null;
   s = String(s).trim().toLowerCase();
@@ -293,34 +306,37 @@ function extractFontFromHtml(html) {
   return null;
 }
 
-// Plukker ut logo-kandidater: <img>-tags med "logo|mark|brand|wordmark", samt
-// apple-touch-icon/icon-meta-tags. Disse skal IKKE filtreres bort som content.
+// Hjelper: HTML-attributter inneholder ofte HTML-entities (&amp;, &#x2F; osv.)
+// — disse må dekodes FØR URL-parsing, ellers blir Next.js og lignende
+// proxy-URL-er ugyldige (f.eks. ?url=...&amp;w=3840 må bli ?url=...&w=3840).
+function toAbsUrl(raw, baseUrl) {
+  if (!raw) return null;
+  const decoded = decodeHtmlEntities(raw.trim());
+  if (!decoded || decoded.startsWith('data:')) return null;
+  try { return new URL(decoded, baseUrl).toString(); } catch { return null; }
+}
+
 function extractLogoUrlsFromHtml(html, baseUrl) {
   const urls = [];
-  // <img> der src/alt/class/id antyder logo
   const imgRe = /<img\b[^>]*>/gi;
   for (const m of html.matchAll(imgRe)) {
     const tag = m[0];
     if (!/\b(logo|mark|brand|wordmark)\b/i.test(tag)) continue;
     const src = (tag.match(/(?:^|\s)(?:src|data-src)=["']([^"']+)["']/i) || [])[1];
-    if (!src || src.startsWith('data:')) continue;
-    try { urls.push(new URL(src, baseUrl).toString()); } catch {}
+    const u = toAbsUrl(src, baseUrl);
+    if (u) urls.push(u);
   }
-  // apple-touch-icon (oftest 180×180 PNG av merket)
   for (const m of html.matchAll(/<link[^>]+rel=["']apple-touch-icon[^"']*["'][^>]+href=["']([^"']+)["']/gi)) {
-    try { urls.push(new URL(m[1], baseUrl).toString()); } catch {}
+    const u = toAbsUrl(m[1], baseUrl); if (u) urls.push(u);
   }
-  // <link rel="icon"> hvis png/jpg/webp (ikke .ico)
   for (const m of html.matchAll(/<link[^>]+rel=["'](?:shortcut )?icon["'][^>]+href=["']([^"']+)["']/gi)) {
     if (!/\.ico(\?|$)/i.test(m[1])) {
-      try { urls.push(new URL(m[1], baseUrl).toString()); } catch {}
+      const u = toAbsUrl(m[1], baseUrl); if (u) urls.push(u);
     }
   }
   return [...new Set(urls)];
 }
 
-// Plukker ut content-bilder (hero, scenes, products) — alt UNNTATT logo/icon/sprite.
-// Henter også fra srcset (største oppløsning) og inline background-image.
 function extractContentImageUrlsFromHtml(html, baseUrl) {
   const urls = new Set();
   const looksLikeAsset = (s) => /\b(logo|mark|brand|wordmark|icon|favicon|sprite|avatar|emoji|spinner|loader)\b/i.test(s);
@@ -331,30 +347,28 @@ function extractContentImageUrlsFromHtml(html, baseUrl) {
     const tag = m[0];
     if (looksLikeAsset(tag)) continue;
     const src = (tag.match(/(?:^|\s)(?:src|data-src)=["']([^"']+)["']/i) || [])[1];
-    if (src && !src.startsWith('data:') && !skipExt(src)) {
-      try { urls.add(new URL(src, baseUrl).toString()); } catch {}
+    if (src && !skipExt(src)) {
+      const u = toAbsUrl(src, baseUrl); if (u) urls.add(u);
     }
-    // srcset: pick largest descriptor (Wpx-w)
     const srcset = (tag.match(/srcset=["']([^"']+)["']/i) || [])[1];
     if (srcset) {
-      const parts = srcset.split(',').map((p) => p.trim().split(/\s+/));
+      const decoded = decodeHtmlEntities(srcset);
+      const parts = decoded.split(',').map((p) => p.trim().split(/\s+/));
       const best = parts.sort((a, b) => parseInt(b[1] || '0') - parseInt(a[1] || '0'))[0]?.[0];
-      if (best && !best.startsWith('data:') && !skipExt(best)) {
-        try { urls.add(new URL(best, baseUrl).toString()); } catch {}
+      if (best && !skipExt(best)) {
+        const u = toAbsUrl(best, baseUrl); if (u) urls.add(u);
       }
     }
   }
-  // background-image i inline-styles + <style>
   for (const m of html.matchAll(/background(?:-image)?\s*:[^;}]*url\(\s*["']?([^)"']+)["']?\s*\)/gi)) {
-    const u = m[1];
-    if (u && !u.startsWith('data:') && !looksLikeAsset(u) && !skipExt(u)) {
-      try { urls.add(new URL(u, baseUrl).toString()); } catch {}
+    const raw = m[1];
+    if (raw && !looksLikeAsset(raw) && !skipExt(raw)) {
+      const u = toAbsUrl(raw, baseUrl); if (u) urls.add(u);
     }
   }
-  // og:image fallback (bra hero, men kan også være logo — vi bruker den)
   const og = html.match(/<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i);
-  if (og) { try { urls.add(new URL(og[1], baseUrl).toString()); } catch {} }
-  return [...urls].slice(0, 20);
+  if (og) { const u = toAbsUrl(og[1], baseUrl); if (u) urls.add(u); }
+  return [...urls].slice(0, 25);
 }
 
 async function scrapeWebsiteAssets(rawUrl, opts = {}) {
@@ -402,18 +416,27 @@ async function scrapeWebsiteAssets(rawUrl, opts = {}) {
   // Content-bilder: last ned kandidater, filtrer ut små.
   const contentUrls = extractContentImageUrlsFromHtml(html, url);
   const images = [];
+  let triedCount = 0;
+  let tooSmallCount = 0;
+  let downloadFailCount = 0;
   for (const u of contentUrls) {
     if (images.length >= maxImages) break;
-    // Ikke last ned logoen som content
     if (logoFile && u === logoFile.url) continue;
+    triedCount++;
     try {
       const { buffer, mediaType } = await fetchImageAsBuffer(u);
-      if (buffer.length < minImageBytes) continue;
+      if (buffer.length < minImageBytes) { tooSmallCount++; continue; }
       images.push({ url: u, buffer, mediaType, source: 'nettsted' });
-    } catch { /* hopp over */ }
+    } catch {
+      downloadFailCount++;
+    }
   }
 
-  return { url, colors, font, logoFile, images, feil: null };
+  return {
+    url, colors, font, logoFile, images,
+    debug: { logoKandidater: logoUrls.length, contentKandidater: contentUrls.length, prøvd: triedCount, forSmaa: tooSmallCount, feilet: downloadFailCount },
+    feil: null,
+  };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -504,10 +527,20 @@ async function analyzeAssets({ job, cust, scrapedImages = [], scrapedLogo = null
 
   const alle = [...analyserte, ...logoer, ...(scrapedLogoEntry ? [scrapedLogoEntry] : [])];
 
-  // Brukbare ekte bilder = vision sa OK OG ikke flagget som logo.
-  const brukbareEkteBilder = analyserte.filter(
-    (r) => r.analyse?.brukbar_som_annonsebilde === true && r.analyse?.type !== 'logo'
-  );
+  // Brukbare ekte bilder:
+  // - jobb/bibliotek-bilder krever vision-OK (eier har lastet opp bevisst).
+  // - nettsted-skrapede bilder aksepteres så lenge de viser noe relevant
+  //   (person/arbeidsplass/produkt) av brukbar kvalitet — vi vil heller bruke
+  //   et ekte brand-bilde enn å AI-generere.
+  const erBrukbarKategori = (t) => t === 'person' || t === 'arbeidsplass' || t === 'produkt';
+  const brukbareEkteBilder = analyserte.filter((r) => {
+    const a = r.analyse;
+    if (!a || a.type === 'logo') return false;
+    if (r.source === 'nettsted') {
+      return erBrukbarKategori(a.type) && a.kvalitet !== 'lav';
+    }
+    return a.brukbar_som_annonsebilde === true;
+  });
 
   // Logo-kandidat: Logo-kolonne > nettsted-skrap > vision-flagget logo i andre bilder.
   const logoFil =
@@ -570,7 +603,7 @@ function buildChecklist({ job, cust, assets }) {
 // Fast minimalistisk template (matcher Maarud/Nasjonalarkivet/CAPUS-samples).
 // Variasjon: ulikt foto per ad, og evt. liten undertittel-variasjon.
 // ─────────────────────────────────────────────────────────────────────────────
-const AD_COUNT = 3;
+const AD_COUNT = 1; // testmodus — sett tilbake til 3 etter at scraping-piping er bekreftet
 
 async function planThreeAds({ job, cust, assets, checklist }) {
   const bildeKatalog = assets.brukbareEkteBilder.length === 0
@@ -899,6 +932,10 @@ async function main() {
       console.log(`   ⚠ skraping feilet: ${scraped.feil}`);
     } else if (scraped) {
       console.log(`   ${scraped.colors.length} farge(r), ${scraped.images.length} content-bilde(r), logo: ${scraped.logoFile ? 'ja' : 'nei'}${scraped.font ? `, font: ${scraped.font}` : ''}`);
+      if (scraped.debug) {
+        const d = scraped.debug;
+        console.log(`   [debug] kandidater: logo=${d.logoKandidater}, content=${d.contentKandidater}, prøvd=${d.prøvd}, forSmaa=${d.forSmaa}, feilet=${d.feilet}`);
+      }
     }
   }
 
