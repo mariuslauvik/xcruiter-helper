@@ -85,7 +85,14 @@ const firstFileUrl = (p) => {
 async function findReadyJob() {
   const res = await notion.dataSources.query({
     data_source_id: STILLINGER_DS,
-    filter: { property: 'Status', select: { equals: STATUS_READY } },
+    // Krev både Levert-status OG koblet Kunde — ellers er det ingenting å gjøre,
+    // og cron-jobben i Actions skal ikke krasje på dataf-problemer.
+    filter: {
+      and: [
+        { property: 'Status', select: { equals: STATUS_READY } },
+        { property: 'Kunde',  relation: { is_not_empty: true } },
+      ],
+    },
     page_size: 1,
   });
   return res.results[0] ?? null;
