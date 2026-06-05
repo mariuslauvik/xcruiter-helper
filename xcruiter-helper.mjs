@@ -52,9 +52,10 @@ const IMAGE_QUALITY = 'high';          // low | medium | high
 
 // To-panel-template: logoen ligger i toppen av safe zone, sentrert. Samme
 // plassering på alle 3 varianter for konsistent merkeidentitet.
+// Krymper til 14% for å unngå overlap med "Vi søker"-pill rett under.
 const LOGO_PLACEMENT = {
   posisjon: 'topp-senter',
-  bredeProsent: 18,
+  bredeProsent: 14,
   beskrivelse: 'centered horizontally near the top of the colored panel',
 };
 
@@ -238,6 +239,7 @@ async function readJobAndCustomer(jobPage) {
     brandFargerRaw:txt(jp['Brand farger']),       // tekst-fallback fargekilde
     nettsted:      txt(jp['Nettsted']),           // URL — skrapes for branding/bilder hvis satt
     dittFirma:     txt(jp['Ditt firma']),
+    font:          txt(jp['Font']),               // per-jobb override (legges til av bruker)
     kundeId:       firstRelationId(jp['Kunde']),
     jobbPhotoUrls,                                // NY: hele lista
     jobbPhotoUrl:  jobbPhotoUrls[0] ?? null,      // BC til § 2 tar over
@@ -295,10 +297,20 @@ function resolveBranding({ cust, job, scraped }) {
     cust.fargerKilde = `nettsted (${scraped.url})`;
   }
 
-  // Font: Kunder-rad > skraped > tom (downstream bruker sans-serif-fallback)
-  if (!cust.font && scraped?.font) {
+  // Font-presedens: stillingens Font > Kunders Font > scraped > Poppins (default).
+  // Stillingens Font har høyest prioritet — brukeren kan overstyre per-jobb.
+  if (job.font) {
+    cust.font = job.font;
+    cust.fontKilde = 'stillingens Font';
+  } else if (cust.font) {
+    // beholdt fra buildCustFromPage — kommer fra Kunders Font
+    cust.fontKilde = 'kundens Font';
+  } else if (scraped?.font) {
     cust.font = scraped.font;
     cust.fontKilde = `nettsted (${scraped.url})`;
+  } else {
+    cust.font = 'Poppins';
+    cust.fontKilde = 'default (Poppins)';
   }
 
   // Kontrast-vakt MÅ kjøre — hindrer gull-på-hvit, hvit-på-hvit, etc.
@@ -842,7 +854,7 @@ async function planThreeAds({ job, cust, assets, checklist, researchContext = nu
 // Ingen CTA, ingen punktliste, ingen URL.
 // ─────────────────────────────────────────────────────────────────────────────
 function buildPrompt(variant, { cust, job, checklist, willCompositeLogo }) {
-  const fontName = cust.font || 'modern sans-serif';
+  const fontName = cust.font || 'Poppins';
   const titleColor    = cust.sekunder;
   const panelColor    = cust.primer;
   const accentColor   = cust.aksent;
@@ -852,10 +864,10 @@ function buildPrompt(variant, { cust, job, checklist, willCompositeLogo }) {
   const undertittel   = (variant.undertittel || '').trim();
 
   // Logo: ligger i topp-panelet, sentrert. Hvis vi compositerer i etterkant,
-  // ber vi modellen om å la et området stå tomt.
+  // ber vi modellen om å la et større område stå tomt så pillen ikke kolliderer.
   const logoBlock = willCompositeLogo
-    ? `LEAVE the top ~12% of the canvas (y=80 to y=300) CLEAN with no text, logo or graphic — only the panel background color. The real customer logo will be composited there in post-processing, ${LOGO_PLACEMENT.beskrivelse}, approximately ${LOGO_PLACEMENT.bredeProsent}% of width.`
-    : `At the top of the panel (centered horizontally, around y=180), render the wordmark "${cust.merke}" in ${titleColor} uppercase ${fontName} letters, approximately ${LOGO_PLACEMENT.bredeProsent}% of the canvas width.`;
+    ? `LEAVE the top region of the canvas (y=200 to y=500) ABSOLUTELY CLEAN — no text, no logo, no pill, no graphic of any kind in this band. ONLY the panel background color. The real customer logo will be composited there in post-processing, ${LOGO_PLACEMENT.beskrivelse}, approximately ${LOGO_PLACEMENT.bredeProsent}% of canvas width. Do NOT place "Vi søker" or any other element in this clean band.`
+    : `At the top of the panel (centered horizontally, around y=300), render the wordmark "${cust.merke}" in ${titleColor} uppercase ${fontName} letters, approximately ${LOGO_PLACEMENT.bredeProsent}% of the canvas width.`;
 
   // Visuell blokk for bunn-panelet
   // HARD REGEL: vi genererer ALDRI folk med AI. Hvis ingen ekte bilde finnes,
@@ -869,7 +881,7 @@ function buildPrompt(variant, { cust, job, checklist, willCompositeLogo }) {
     : `Generate a real candid PHOTOGRAPH (not illustration, not 3D render) for the bottom half showing ${variant.bilde?.generer_beskrivelse || `a workplace environment or relevant tools/equipment for the role "${hovedtittel}", WITHOUT any people`}.${realismBlock}`;
 
   const undertittelBlock = undertittel
-    ? `\n  4. A small subtitle directly below the title in ${titleColor} (lighter weight, single line): "${undertittel}".`
+    ? `\n  4. A small subtitle directly below the title around y=920 in ${titleColor} (lighter weight, single line): "${undertittel}".`
     : '';
 
   // Tekst som MÅ gjengis bokstavelig
@@ -886,10 +898,10 @@ Minimal, premium executive recruitment poster style — clean, restrained, on-br
 
 STRICT TWO-PANEL LAYOUT (50/50 split — single crisp horizontal seam at y=960):
 
-TOP PANEL (y=0 to y=960): SOLID ${panelColor} background, no gradient, no texture, no photo. Contains:
+TOP PANEL (y=0 to y=960): SOLID ${panelColor} background, no gradient, no texture, no photo. Contains, in this strict vertical order:
   1. ${logoBlock}
-  2. Below the logo area, around y=420, a small rounded pill/badge centered horizontally containing the small text "Vi søker" in ${titleColor}. The pill has a thin ${titleColor} outline OR a subtle ${usePalette ? `${accentColor} or ${titleColor}` : 'tasteful'} fill. Small caps NOT required — sentence case "Vi søker" is correct.
-  3. Below the pill, around y=550 to y=820, the JOB TITLE in very large bold ${fontName} letters, ${titleColor}, centered horizontally, 1–2 lines max: "${hovedtittel}".${undertittelBlock}
+  2. Below the logo clean band, around y=560, a small rounded pill/badge centered horizontally containing the small text "Vi søker" in ${titleColor}. The pill has a thin ${titleColor} outline OR a subtle ${usePalette ? `${accentColor} or ${titleColor}` : 'tasteful'} fill. Sentence case "Vi søker" — do NOT put "Vi søker" near or behind the logo.
+  3. Below the pill, around y=680 to y=900, the JOB TITLE in very large bold ${fontName} letters, ${titleColor}, centered horizontally, 1–2 lines max: "${hovedtittel}".${undertittelBlock}
 
 BOTTOM PANEL (y=960 to y=1920): FULL-BLEED real photograph, edge to edge, no borders, no rounded corners. ${visualBlock}
 
