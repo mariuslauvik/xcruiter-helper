@@ -482,17 +482,19 @@ async function scrapeWebsiteAssets(rawUrl, opts = {}) {
   const colors = extractColorsFromHtml(html);
   const font   = extractFontFromHtml(html);
 
-  // Logo: prøv kandidatene i rekkefølge, returner første som lastes ned ok.
+  // Logo: last ned ALLE kandidater (opp til 5). Vision-bekrefter mot selskapet
+  // i analyzeAssets — vi stoler ikke på første nedlastbare før vi vet at det
+  // faktisk er logoen til dette firmaet.
   const logoUrls = extractLogoUrlsFromHtml(html, url);
-  let logoFile = null;
-  for (const u of logoUrls) {
+  const logoCandidates = [];
+  for (const u of logoUrls.slice(0, 5)) {
     try {
       const { buffer, mediaType } = await fetchImageAsBuffer(u);
-      if (buffer.length < 1000) continue; // for liten — sannsynligvis tomme/feil
-      logoFile = { url: u, buffer, mediaType, source: 'nettsted-logo' };
-      break;
-    } catch { /* prøv neste */ }
+      if (buffer.length < 1000) continue;
+      logoCandidates.push({ url: u, buffer, mediaType });
+    } catch { /* hopp over */ }
   }
+  const logoFile = null; // beholdt for BC; analyzeAssets velger riktig kandidat
 
   // Content-bilder: last ned kandidater, filtrer ut små.
   const contentUrls = extractContentImageUrlsFromHtml(html, url);
@@ -514,8 +516,8 @@ async function scrapeWebsiteAssets(rawUrl, opts = {}) {
   }
 
   return {
-    url, colors, font, logoFile, images,
-    debug: { logoKandidater: logoUrls.length, contentKandidater: contentUrls.length, prøvd: triedCount, forSmaa: tooSmallCount, feilet: downloadFailCount },
+    url, colors, font, logoFile, logoCandidates, images,
+    debug: { logoKandidater: logoUrls.length, logoLastetNed: logoCandidates.length, contentKandidater: contentUrls.length, prøvd: triedCount, forSmaa: tooSmallCount, feilet: downloadFailCount },
     feil: null,
   };
 }
@@ -606,6 +608,50 @@ async function analyzeOneImage(url, source) {
   }
 }
 
+// Vision-verifisering: er DETTE bildet logoen til DETTE selskapet?
+// Brukes på scraped logo-kandidater. Claude vurderer både bokstavelig
+// tekstmatch og initialer/monogrammer (f.eks. "LM" kan være "Lauvico AS").
+async function verifyLogoMatch({ buffer, mediaType, url, merke }) {
+  try {
+    const msg = await anthropic.messages.create({
+      model: COPY_MODEL,
+      max_tokens: 250,
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'image', source: { type: 'base64', media_type: mediaType, data: buffer.toString('base64') } },
+          { type: 'text', text:
+            `Se på bildet og vurder om det kan være logoen til selskapet "${merke}". ` +
+            `Tenk på bokstavelige tekstmatcher, initialer/monogrammer (f.eks. "LM" kan være ` +
+            `forkortelse for "Lauvico AS"), og visuelle merkesymboler. Returner KUN rå JSON, ingen markdown:\n` +
+            `{"er_logo":true|false,"er_dette_logoen":true|false,"sikkerhet":"høy|middels|lav",` +
+            `"tekst_i_bildet":"<eksakt tekst du leser, eller tom>",` +
+            `"begrunnelse":"<kort hvorfor du sa ja/nei>"}`,
+          },
+        ],
+      }],
+    });
+    const raw = msg.content[0].text.trim().replace(/^```json\s*|\s*```$/g, '');
+    const r = JSON.parse(raw);
+    const match = r.er_logo === true && r.er_dette_logoen === true && r.sikkerhet !== 'lav';
+    return {
+      url, source: 'nettsted-logo', buffer, mediaType,
+      analyse: {
+        type: r.er_logo ? 'logo' : 'annet',
+        brukbar_som_annonsebilde: false,
+        kvalitet: r.sikkerhet || 'middels',
+        hva: r.tekst_i_bildet ? `logo med tekst "${r.tekst_i_bildet}"` : 'logo uten lesbar tekst',
+        notat: r.begrunnelse || '',
+        match,
+        tekst: r.tekst_i_bildet || '',
+      },
+      feil: null,
+    };
+  } catch (err) {
+    return { url, source: 'nettsted-logo', buffer: null, mediaType: null, analyse: null, feil: err.message };
+  }
+}
+
 async function loadLogoOnly(url) {
   // Logo-kolonnen er per definisjon en logo — vi trenger bare bytene til § 5
   // (compositing). Vision-analyse hoppes over for å spare et Claude-kall.
@@ -621,7 +667,7 @@ async function loadLogoOnly(url) {
   }
 }
 
-async function analyzeAssets({ job, cust, scrapedImages = [], scrapedLogo = null }) {
+async function analyzeAssets({ job, cust, scrapedImages = [], scrapedLogoCandidates = [], merke = '' }) {
   const visionTasks = [
     ...job.jobbPhotoUrls.map((u) => analyzeOneImage(u, 'jobb')),
     ...cust.bildebibliotekUrls.map((u) => analyzeOneImage(u, 'bibliotek')),
@@ -629,30 +675,32 @@ async function analyzeAssets({ job, cust, scrapedImages = [], scrapedLogo = null
   ];
   const logoTasks = cust.logoUrls.map(loadLogoOnly);
 
-  // SPEC v3 §c — vision-bekreft scraped logo før vi stoler på den som logo.
-  // Hvis vision sier "ikke logo", behandle bildet som content i stedet.
-  const scrapedLogoTask = scrapedLogo
-    ? analyzeImageData({
-        buffer: scrapedLogo.buffer, mediaType: scrapedLogo.mediaType,
-        url: scrapedLogo.url, source: 'nettsted-logo-kandidat',
-      })
-    : Promise.resolve(null);
+  // SPEC v3 §c + hardregel: vision-verifiserer HVER scraped logo-kandidat mot selskapet.
+  // Bare "match=true"-resultater regnes som gyldig logo.
+  const logoVerifyTasks = scrapedLogoCandidates.map((c) =>
+    verifyLogoMatch({ buffer: c.buffer, mediaType: c.mediaType, url: c.url, merke })
+  );
 
-  const [analyserte, logoer, scrapedLogoAnalysed] = await Promise.all([
+  const [analyserte, logoer, verifiedLogos] = await Promise.all([
     Promise.all(visionTasks),
     Promise.all(logoTasks),
-    scrapedLogoTask,
+    Promise.all(logoVerifyTasks),
   ]);
 
-  let scrapedLogoEntry = null;
-  if (scrapedLogoAnalysed?.analyse?.type === 'logo') {
-    scrapedLogoEntry = scrapedLogoAnalysed;
-  } else if (scrapedLogoAnalysed?.analyse) {
-    // Vision sa ikke-logo — flytt over til nettsted-content så brukbarhetsfilteret tar den.
-    analyserte.push({ ...scrapedLogoAnalysed, source: 'nettsted' });
+  // Plukk første kandidat hvor vision sa "ja, dette er logoen til {merke}"
+  const scrapedLogoEntry = verifiedLogos.find((r) => r.analyse?.match === true) ?? null;
+
+  // Avviste kandidater (er logo, men ikke vårt firma) → bare logges, kastes
+  const avvisteLogos = verifiedLogos.filter((r) => r.analyse && !r.analyse.match);
+
+  // Hvis en kandidat ikke var logo, kan den brukes som content
+  for (const r of verifiedLogos) {
+    if (r.analyse && r.analyse.type !== 'logo') {
+      analyserte.push({ ...r, source: 'nettsted' });
+    }
   }
 
-  const alle = [...analyserte, ...logoer, ...(scrapedLogoEntry ? [scrapedLogoEntry] : [])];
+  const alle = [...analyserte, ...logoer, ...(scrapedLogoEntry ? [scrapedLogoEntry] : []), ...avvisteLogos];
 
   // SPEC v3 §b — Bildehierarki:
   //  • Opplastede JOBB-bilder aksepteres ALLTID (utenom logo-routing) —
@@ -1091,10 +1139,10 @@ async function main() {
   if (scraped?.feil) {
     console.log(`   ⚠ skraping feilet: ${scraped.feil}`);
   } else if (scraped) {
-    console.log(`   ${scraped.colors.length} farge(r), ${scraped.images.length} content-bilde(r), logo: ${scraped.logoFile ? 'ja' : 'nei'}${scraped.font ? `, font: ${scraped.font}` : ''}`);
+    console.log(`   ${scraped.colors.length} farge(r), ${scraped.images.length} content-bilde(r), ${scraped.logoCandidates?.length ?? 0} logo-kandidat(er)${scraped.font ? `, font: ${scraped.font}` : ''}`);
     if (scraped.debug) {
       const d = scraped.debug;
-      console.log(`   [debug] kandidater: logo=${d.logoKandidater}, content=${d.contentKandidater}, prøvd=${d.prøvd}, forSmaa=${d.forSmaa}, feilet=${d.feilet}`);
+      console.log(`   [debug] kandidater: logo=${d.logoKandidater}/${d.logoLastetNed}lastet, content=${d.contentKandidater}, prøvd=${d.prøvd}, forSmaa=${d.forSmaa}, feilet=${d.feilet}`);
     }
   }
   if (research?.feil) {
@@ -1110,19 +1158,32 @@ async function main() {
   console.log(`   Fargekilde: ${cust.fargerKilde} (${cust.alle.length} hex)`);
   console.log(`   Panel ${cust.primer} / Tekst ${cust.sekunder} / Aksent ${cust.aksent} — kontrast ${cust.kontrast.kontrast.toFixed(2)}${cust.kontrast.justert ? ` (justert: ${cust.kontrast.justert})` : ''}`);
   if (cust.font) console.log(`   Font: ${cust.font} (${cust.fontKilde})`);
-  console.log(`   Bilder: jobb=${job.jobbPhotoUrls.length}, bibliotek=${cust.bildebibliotekUrls.length}, nettsted=${scraped?.images.length ?? 0}, logo=${cust.logoUrls.length}${scraped?.logoFile ? ' + scraped' : ''}`);
+  const scrapedLogoCandidates = scraped?.logoCandidates ?? [];
+  console.log(`   Bilder: jobb=${job.jobbPhotoUrls.length}, bibliotek=${cust.bildebibliotekUrls.length}, nettsted=${scraped?.images.length ?? 0}, kunde-logo=${cust.logoUrls.length}, nettsted-logo-kandidater=${scrapedLogoCandidates.length}`);
 
-  const totalToAnalyze = job.jobbPhotoUrls.length + cust.bildebibliotekUrls.length + (scraped?.images.length ?? 0);
-  if (totalToAnalyze + cust.logoUrls.length > 0 || scraped?.logoFile) {
-    console.log(`→ Analyserer ${totalToAnalyze} bilde(r) med vision + henter logo(er)...`);
-  } else {
-    console.log('→ Ingen opplastede bilder å analysere.');
-  }
+  console.log(`→ Analyserer + vision-verifiserer logo-kandidater...`);
   const assets = await analyzeAssets({
     job, cust,
     scrapedImages: scraped?.images ?? [],
-    scrapedLogo:   scraped?.logoFile ?? null,
+    scrapedLogoCandidates,
+    merke: cust.merke,
   });
+
+  // HARD HALT: ingen verifisert logo, ingen kjøring
+  if (!assets.logoFil) {
+    const avvist = assets.alle.filter((r) => r.source === 'nettsted-logo' && r.analyse && !r.analyse.match);
+    let detalj = '';
+    if (avvist.length) {
+      detalj = '\nAvviste logo-kandidater fra nettstedet:\n' +
+        avvist.map((r) => `  • ${r.url.slice(0, 80)} — tekst: "${r.analyse?.tekst || '(ingen)'}", grunn: ${r.analyse?.notat || 'ikke vurdert som riktig logo'}`).join('\n');
+    }
+    throw new Error(
+      `Logo mangler for "${cust.merke}". Vi går ikke videre uten verifisert logo.\n` +
+      `Fix: 1) Last opp logo i Kunder-databasen (Logo-feltet), ELLER ` +
+      `2) Last opp logo på jobben (Bilder til annonse — vision ruter den), ELLER ` +
+      `3) Bekreft at nettstedet "${job.nettsted || '(ikke satt)'}" eksponerer en gjenkjennelig logo med selskapsnavnet.${detalj}`
+    );
+  }
   console.log(`   Brukbare ekte bilder: ${assets.brukbareEkteBilder.length} / ${totalToAnalyze}`);
   console.log(`   Logo funnet: ${assets.logoFil ? 'ja' : 'nei'}`);
   for (const a of assets.alle) {
