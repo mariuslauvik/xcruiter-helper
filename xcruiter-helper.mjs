@@ -120,6 +120,53 @@ function parseColors(s) {
   };
 }
 
+// WCAG-stil relativ luminans og kontrast — brukes til å sikre at panel-farge
+// (primer) og tekst-farge (sekunder) er lesbare sammen.
+function rgbFromHex(hex) {
+  const m = String(hex || '').match(/^#?([0-9a-f]{6})$/i);
+  if (!m) return null;
+  const n = parseInt(m[1], 16);
+  return { r: (n >> 16) & 255, g: (n >> 8) & 255, b: n & 255 };
+}
+function relativeLuminance(hex) {
+  const rgb = rgbFromHex(hex);
+  if (!rgb) return 0.5;
+  const ch = (c) => { c /= 255; return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4); };
+  return 0.2126 * ch(rgb.r) + 0.7152 * ch(rgb.g) + 0.0722 * ch(rgb.b);
+}
+function contrastRatio(a, b) {
+  const La = relativeLuminance(a), Lb = relativeLuminance(b);
+  const hi = Math.max(La, Lb), lo = Math.min(La, Lb);
+  return (hi + 0.05) / (lo + 0.05);
+}
+// Sikrer at primer (panel) og sekunder (tekst) har kontrast ≥ 4.5 (WCAG AA).
+// Hvis ikke: prøv først å bytte roller, deretter overstyr sekunder til
+// en trygg lys/mørk verdi avhengig av panel-luminansen.
+function ensureColorContrast(cust) {
+  const MIN = 4.5;
+  const DARK_TEXT  = '#1A1A1A';
+  const LIGHT_TEXT = '#F5F1E8';
+
+  let kontrast = contrastRatio(cust.primer, cust.sekunder);
+  if (kontrast >= MIN) return { ok: true, kontrast, justert: null };
+
+  // 1) Bytte roller hvis sekunder er klart mørkere/lysere enn primer
+  //    (begge er kandidater til panel/tekst — bare velg riktig rolle).
+  const Lp = relativeLuminance(cust.primer);
+  const Ls = relativeLuminance(cust.sekunder);
+  if (Math.abs(Lp - Ls) >= 0.4) {
+    [cust.primer, cust.sekunder] = [cust.sekunder, cust.primer];
+    kontrast = contrastRatio(cust.primer, cust.sekunder);
+    if (kontrast >= MIN) return { ok: true, kontrast, justert: 'byttet primer↔sekunder' };
+  }
+
+  // 2) Overstyr sekunder til trygg kontrastfarge basert på panel-luminans.
+  const panelLum = relativeLuminance(cust.primer);
+  cust.sekunder = panelLum > 0.4 ? DARK_TEXT : LIGHT_TEXT;
+  kontrast = contrastRatio(cust.primer, cust.sekunder);
+  return { ok: kontrast >= MIN, kontrast, justert: `sekunder → ${cust.sekunder}` };
+}
+
 async function findKundeRowByName(name) {
   if (!name) return null;
   const trimmed = name.trim();
@@ -235,6 +282,10 @@ function resolveBranding({ cust, job, scraped }) {
     cust.font = scraped.font;
     cust.fontKilde = `nettsted (${scraped.url})`;
   }
+
+  // Sikre kontrast mellom panel (primer) og tekst (sekunder) — gull-på-hvit blokkeres.
+  const kontrast = ensureColorContrast(cust);
+  cust.kontrast = kontrast;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -648,8 +699,11 @@ async function planThreeAds({ job, cust, assets, checklist }) {
     `- Foretrekk ekte bilder. Hvis det finnes ${AD_COUNT} eller flere brukbare bilder, ` +
     `bruk ULIKT bilde per variant. Hvis færre finnes, kan flere varianter dele bilde — ` +
     `da må undertittelen variere for å gi visuell forskjell.\n` +
-    `- Hvis ingen brukbare ekte bilder finnes, sett mode="generer" og beskriv kort ` +
-    `(generer_beskrivelse) en realistisk arbeidsplass-scene som matcher stillingen.\n` +
+    `- HARD REGEL: hvis du må sette mode="generer", er det ABSOLUTT FORBUDT å beskrive ` +
+    `mennesker. Generer_beskrivelse må beskrive et MILJØ eller objekter (verktøy, kontor, ` +
+    `produkt, materialer, arkitektur) som matcher stillingen — INGEN folk, INGEN ansikter, ` +
+    `INGEN kroppsdeler, INGEN silhuetter. F.eks. for "Kokk": kjøkken-stasjon med kniver og ` +
+    `råvarer (ingen kokk). For "CFO": stilrent møterom eller skrivebord (ingen leder).\n` +
     `\n` +
     `JSON-skjema per variant:\n` +
     `{\n` +
@@ -714,13 +768,15 @@ function buildPrompt(variant, { cust, job, checklist, willCompositeLogo }) {
     : `At the top of the panel (centered horizontally, around y=180), render the wordmark "${cust.merke}" in ${titleColor} uppercase ${fontName} letters, approximately ${LOGO_PLACEMENT.bredeProsent}% of the canvas width.`;
 
   // Visuell blokk for bunn-panelet
+  // HARD REGEL: vi genererer ALDRI folk med AI. Hvis ingen ekte bilde finnes,
+  // må scenen vise miljø/verktøy/utstyr/produkt/arkitektur — INGEN mennesker.
   const realismBlock = variant.bilde?.mode === 'generer'
-    ? ` Photo MUST look like a real candid documentary photograph: shot on a real camera with a 35–50mm lens, natural directional daylight, real skin texture with visible pores and fine lines, asymmetrical natural features, relaxed unposed expression, anatomically correct hands with five fingers, natural teeth and eyes, real worn clothing with creases, slight film grain. FORBIDDEN: waxy or plastic skin, perfect symmetry, HDR glow, extra or missing fingers, mannequin/CGI look, airbrushed retouching, AI-perfect features, glossy CG sheen.`
+    ? ` STRICTLY NO PEOPLE — ABSOLUTELY FORBIDDEN to depict any human figure, face, hand, arm, leg, body part, silhouette, or person in any way. Show ONLY environment, tools, equipment, products, architecture, materials, or atmospheric details relevant to the role. The scene must look like a real candid documentary photograph of an empty workspace or relevant objects: shot on a real camera with a 35–50mm lens, natural directional daylight, real surface textures, slight film grain, no HDR glow, no CGI sheen. If a person would naturally appear in this kind of scene, frame the photo to exclude them (over-the-shoulder, low angle, detail shot, etc.). NO people anywhere in the image.`
     : '';
 
   const visualBlock = variant.bilde?.mode === 'bruk_bilde'
     ? `USE the provided photograph for the bottom half, kept REAL and UNALTERED. Crop/scale it to fill the entire bottom half edge-to-edge while keeping the main subject(s) centered. Do not re-render the people or scene. No borders, no rounded corners, no filters.`
-    : `Generate a real candid workplace photograph for the bottom half: ${variant.bilde?.generer_beskrivelse || `a relevant scene for the role "${hovedtittel}"`}.${realismBlock}`;
+    : `Generate a real candid PHOTOGRAPH (not illustration, not 3D render) for the bottom half showing ${variant.bilde?.generer_beskrivelse || `a workplace environment or relevant tools/equipment for the role "${hovedtittel}", WITHOUT any people`}.${realismBlock}`;
 
   const undertittelBlock = undertittel
     ? `\n  4. A small subtitle directly below the title in ${titleColor} (lighter weight, single line): "${undertittel}".`
@@ -941,6 +997,7 @@ async function main() {
 
   resolveBranding({ cust, job, scraped });
   console.log(`   Fargekilde: ${cust.fargerKilde} (${cust.alle.length} hex)`);
+  console.log(`   Panel ${cust.primer} / Tekst ${cust.sekunder} / Aksent ${cust.aksent} — kontrast ${cust.kontrast.kontrast.toFixed(2)}${cust.kontrast.justert ? ` (justert: ${cust.kontrast.justert})` : ''}`);
   if (cust.font) console.log(`   Font: ${cust.font} (${cust.fontKilde})`);
   console.log(`   Bilder: jobb=${job.jobbPhotoUrls.length}, bibliotek=${cust.bildebibliotekUrls.length}, nettsted=${scraped?.images.length ?? 0}, logo=${cust.logoUrls.length}${scraped?.logoFile ? ' + scraped' : ''}`);
 
