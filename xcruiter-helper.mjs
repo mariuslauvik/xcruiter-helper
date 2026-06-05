@@ -1221,8 +1221,9 @@ async function main() {
       `3) Bekreft at nettstedet "${job.nettsted || '(ikke satt)'}" eksponerer en gjenkjennelig logo med selskapsnavnet.${detalj}`
     );
   }
-  console.log(`   Brukbare ekte bilder: ${assets.brukbareEkteBilder.length} / ${totalToAnalyze}`);
-  console.log(`   Logo funnet: ${assets.logoFil ? 'ja' : 'nei'}`);
+  const totalAnalysed = assets.alle.filter((a) => a.analyse && a.source !== 'nettsted-logo').length;
+  console.log(`   Brukbare ekte bilder: ${assets.brukbareEkteBilder.length} / ${totalAnalysed}`);
+  console.log(`   Logo funnet: ja (${assets.logoFil.source || 'ukjent'})`);
   for (const a of assets.alle) {
     if (a.feil) console.log(`   ⚠ ${a.source}: ${a.feil}`);
     else if (a.analyse) console.log(`   [${a.source}] ${a.analyse.type}/${a.analyse.kvalitet}: ${a.analyse.hva}`);
