@@ -725,12 +725,31 @@ async function analyzeAssets({ job, cust, scrapedImages = [], scrapedLogoCandida
 
   // Logo-presedens: Kunde Logo-kolonne > jobb-bilde flagget som logo
   // > scraped-logo > vision-flagget logo i andre kilder.
-  const logoFil =
+  let logoFil =
     logoer.find((r) => !r.feil) ??
     jobbSomLogo ??
     scrapedLogoEntry ??
     analyserte.find((r) => r.analyse?.type === 'logo' && r.source !== 'jobb' && !r.feil) ??
     null;
+
+  // Siste fallback: hvis ingen logo funnet, kjør verifyLogoMatch på jobb-bilder.
+  // Den generelle vision-analysen er content-fokusert og kan misse at et
+  // jobb-uploadet bilde er logoen. Denne stiller spørsmålet direkte.
+  if (!logoFil && merke) {
+    const jobbBilder = analyserte.filter((r) => r.source === 'jobb' && !r.feil && r.buffer);
+    for (const j of jobbBilder) {
+      const verified = await verifyLogoMatch({
+        buffer: j.buffer, mediaType: j.mediaType, url: j.url, merke,
+      });
+      if (verified.analyse?.match) {
+        logoFil = { ...verified, source: 'jobb-uploadet-logo' };
+        // Fjern fra brukbareEkteBilder så det ikke også brukes som hovedbilde
+        const idx = brukbareEkteBilder.findIndex((b) => b.url === j.url);
+        if (idx >= 0) brukbareEkteBilder.splice(idx, 1);
+        break;
+      }
+    }
+  }
 
   return { alle, brukbareEkteBilder, logoFil };
 }
