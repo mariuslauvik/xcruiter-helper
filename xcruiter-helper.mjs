@@ -568,8 +568,21 @@ const SUPPORTED_IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/gif', 'image/we
 async function fetchImageAsBuffer(url) {
   const res = await fetch(url);
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  const buffer = Buffer.from(await res.arrayBuffer());
+  let buffer = Buffer.from(await res.arrayBuffer());
   let mediaType = (res.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
+
+  // SVG: vision godtar ikke SVG, og sharp kan ikke composite SVG som inline buffer.
+  // Rasteriser til PNG med god oppløsning så både vision-analyse og logo-compositing virker.
+  const isSvg = mediaType === 'image/svg+xml' || /\.svg(\?|$)/i.test(url);
+  if (isSvg) {
+    const { default: sharp } = await import('sharp');
+    buffer = await sharp(buffer, { density: 300 })
+      .resize({ width: 1024, withoutEnlargement: false })
+      .png()
+      .toBuffer();
+    mediaType = 'image/png';
+  }
+
   if (!SUPPORTED_IMAGE_TYPES.includes(mediaType)) mediaType = 'image/jpeg';
   return { buffer, mediaType };
 }
