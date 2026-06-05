@@ -261,21 +261,39 @@ async function readJobAndCustomer(jobPage) {
 
 // Setter sammen endelig branding-presedens. Kalles fra main() etter at både
 // Kunder-rad og evt. nettsted er hentet.
+// SPEC v3 §a-rekkefølge: stillingens "Brand farger" > Kunders Merkevarefarger
+// > Nettsted-skrap > defaults. ensureColorContrast er obligatorisk siste steg.
 function resolveBranding({ cust, job, scraped }) {
-  // Farger: Kunder-rad > stillingens "Brand farger" > skraped fra Nettsted > defaults
-  if (cust.alle.length === 0 && job.brandFargerRaw) {
+  // Hva Kunder-raden allerede ga oss via buildCustFromPage
+  const fraKunde = cust.alle.length > 0
+    ? { alle: cust.alle, primer: cust.primer, sekunder: cust.sekunder, aksent: cust.aksent }
+    : null;
+
+  // Nullstill til defaults og bygg opp via presedens
+  const def = parseColors('');
+  cust.alle = []; cust.primer = def.primer; cust.sekunder = def.sekunder; cust.aksent = def.aksent;
+  cust.fargerKilde = 'defaults';
+
+  // 1) Stillingens "Brand farger" vinner
+  if (job.brandFargerRaw) {
     const c = parseColors(job.brandFargerRaw);
     if (c.alle.length > 0) {
       cust.alle = c.alle; cust.primer = c.primer; cust.sekunder = c.sekunder; cust.aksent = c.aksent;
       cust.fargerKilde = 'stillingens "Brand farger"';
     }
   }
+  // 2) Kunders Merkevarefarger
+  if (cust.alle.length === 0 && fraKunde) {
+    cust.alle = fraKunde.alle;
+    cust.primer = fraKunde.primer; cust.sekunder = fraKunde.sekunder; cust.aksent = fraKunde.aksent;
+    cust.fargerKilde = 'kundens Merkevarefarger';
+  }
+  // 3) Nettsted-skrap
   if (cust.alle.length === 0 && scraped?.colors?.length > 0) {
     const c = parseColors(scraped.colors.join(' '));
     cust.alle = c.alle; cust.primer = c.primer; cust.sekunder = c.sekunder; cust.aksent = c.aksent;
     cust.fargerKilde = `nettsted (${scraped.url})`;
   }
-  if (cust.alle.length === 0) cust.fargerKilde = 'defaults';
 
   // Font: Kunder-rad > skraped > tom (downstream bruker sans-serif-fallback)
   if (!cust.font && scraped?.font) {
@@ -283,7 +301,7 @@ function resolveBranding({ cust, job, scraped }) {
     cust.fontKilde = `nettsted (${scraped.url})`;
   }
 
-  // Sikre kontrast mellom panel (primer) og tekst (sekunder) — gull-på-hvit blokkeres.
+  // Kontrast-vakt MÅ kjøre — hindrer gull-på-hvit, hvit-på-hvit, etc.
   const kontrast = ensureColorContrast(cust);
   cust.kontrast = kontrast;
 }
@@ -491,6 +509,44 @@ async function scrapeWebsiteAssets(rawUrl, opts = {}) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Step 2a' — researchCompany via Anthropic web_search (SPEC v3 §d)
+// Beriker konteksten med bransje/hva-de-gjør/målgruppe/tone — overstyrer ALDRI
+// det kunden faktisk har lagt inn. Returnerer null hvis usikker (sikkerhet=lav).
+// ─────────────────────────────────────────────────────────────────────────────
+async function researchCompany({ navn, nettsted, sted }) {
+  if (!navn) return null;
+  try {
+    const msg = await anthropic.messages.create({
+      model: COPY_MODEL,
+      max_tokens: 1024,
+      tools: [{ type: 'web_search_20250305', name: 'web_search', max_uses: 3 }],
+      messages: [{
+        role: 'user',
+        content:
+          `Søk på nettet etter firmaet "${navn}"` +
+          `${nettsted ? ` (nettsted: ${nettsted})` : ''}` +
+          `${sted ? `, sted: ${sted}` : ''}. ` +
+          `Returner KUN rå JSON, ingen markdown, ingen forklaring:\n` +
+          `{"bransje":"<kort, f.eks. 'fintech', 'restaurant'>",` +
+          `"hva_de_gjør":"<én setning>",` +
+          `"målgruppe":"<hvem de selger til / jobber for>",` +
+          `"tone":"<formell|profesjonell|varm|teknisk|kreativ|annet>",` +
+          `"sikkerhet":"høy|lav"}\n` +
+          `Sett sikkerhet="lav" hvis du er usikker på at det er riktig firma — da ignoreres svaret.`,
+      }],
+    });
+    const textBlock = msg.content.filter((b) => b.type === 'text').pop();
+    if (!textBlock?.text) return null;
+    const raw = textBlock.text.trim().replace(/^```json\s*|\s*```$/g, '');
+    const result = JSON.parse(raw);
+    if (result.sikkerhet === 'lav') return { ...result, ignored: true };
+    return result;
+  } catch (err) {
+    return { feil: err.message };
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Step 2b — analyser alle opplastede bilder med Claude vision (§ 2)
 // ─────────────────────────────────────────────────────────────────────────────
 const SUPPORTED_IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
@@ -554,50 +610,66 @@ async function loadLogoOnly(url) {
 }
 
 async function analyzeAssets({ job, cust, scrapedImages = [], scrapedLogo = null }) {
-  // Bilder fra jobb + bibliotek + nettsted analyseres med vision; logo lastes bare ned.
   const visionTasks = [
     ...job.jobbPhotoUrls.map((u) => analyzeOneImage(u, 'jobb')),
     ...cust.bildebibliotekUrls.map((u) => analyzeOneImage(u, 'bibliotek')),
     ...scrapedImages.map((img) => analyzeImageData({ buffer: img.buffer, mediaType: img.mediaType, url: img.url, source: 'nettsted' })),
   ];
   const logoTasks = cust.logoUrls.map(loadLogoOnly);
-  const [analyserte, logoer] = await Promise.all([
+
+  // SPEC v3 §c — vision-bekreft scraped logo før vi stoler på den som logo.
+  // Hvis vision sier "ikke logo", behandle bildet som content i stedet.
+  const scrapedLogoTask = scrapedLogo
+    ? analyzeImageData({
+        buffer: scrapedLogo.buffer, mediaType: scrapedLogo.mediaType,
+        url: scrapedLogo.url, source: 'nettsted-logo-kandidat',
+      })
+    : Promise.resolve(null);
+
+  const [analyserte, logoer, scrapedLogoAnalysed] = await Promise.all([
     Promise.all(visionTasks),
     Promise.all(logoTasks),
+    scrapedLogoTask,
   ]);
 
-  // Skrapet logo behandles som loadLogoOnly-resultat (allerede har bytene).
-  const scrapedLogoEntry = scrapedLogo
-    ? {
-        url: scrapedLogo.url, source: 'nettsted-logo',
-        buffer: scrapedLogo.buffer, mediaType: scrapedLogo.mediaType,
-        analyse: { type: 'logo', brukbar_som_annonsebilde: false, kvalitet: 'høy', hva: 'logo skraped fra nettsted', notat: 'apple-touch-icon / img med logo-hint' },
-        feil: null,
-      }
-    : null;
+  let scrapedLogoEntry = null;
+  if (scrapedLogoAnalysed?.analyse?.type === 'logo') {
+    scrapedLogoEntry = scrapedLogoAnalysed;
+  } else if (scrapedLogoAnalysed?.analyse) {
+    // Vision sa ikke-logo — flytt over til nettsted-content så brukbarhetsfilteret tar den.
+    analyserte.push({ ...scrapedLogoAnalysed, source: 'nettsted' });
+  }
 
   const alle = [...analyserte, ...logoer, ...(scrapedLogoEntry ? [scrapedLogoEntry] : [])];
 
-  // Brukbare ekte bilder:
-  // - jobb/bibliotek-bilder krever vision-OK (eier har lastet opp bevisst).
-  // - nettsted-skrapede bilder aksepteres så lenge de viser noe relevant
-  //   (person/arbeidsplass/produkt) av brukbar kvalitet — vi vil heller bruke
-  //   et ekte brand-bilde enn å AI-generere.
+  // SPEC v3 §b — Bildehierarki:
+  //  • Opplastede JOBB-bilder aksepteres ALLTID (utenom logo-routing) —
+  //    kunden har lastet dem opp bevisst, vision beskriver bare.
+  //  • Bibliotek/nettsted-bilder krever passende type + kvalitet.
+  //  • Et opplastet jobb-bilde som flagges som logo rutes til logo-slot.
   const erBrukbarKategori = (t) => t === 'person' || t === 'arbeidsplass' || t === 'produkt';
+
+  const jobbSomLogo = analyserte.find(
+    (r) => r.source === 'jobb' && r.analyse?.type === 'logo' && !r.feil
+  );
+
   const brukbareEkteBilder = analyserte.filter((r) => {
     const a = r.analyse;
     if (!a || a.type === 'logo') return false;
-    if (r.source === 'nettsted') {
+    if (r.source === 'jobb') return true;               // aldri avvis opplastet
+    if (r.source === 'bibliotek' || r.source === 'nettsted') {
       return erBrukbarKategori(a.type) && a.kvalitet !== 'lav';
     }
-    return a.brukbar_som_annonsebilde === true;
+    return false;
   });
 
-  // Logo-kandidat: Logo-kolonne > nettsted-skrap > vision-flagget logo i andre bilder.
+  // Logo-presedens: Kunde Logo-kolonne > jobb-bilde flagget som logo
+  // > scraped-logo > vision-flagget logo i andre kilder.
   const logoFil =
     logoer.find((r) => !r.feil) ??
+    jobbSomLogo ??
     scrapedLogoEntry ??
-    analyserte.find((r) => r.analyse?.type === 'logo' && !r.feil) ??
+    analyserte.find((r) => r.analyse?.type === 'logo' && r.source !== 'jobb' && !r.feil) ??
     null;
 
   return { alle, brukbareEkteBilder, logoFil };
@@ -652,11 +724,20 @@ function buildChecklist({ job, cust, assets }) {
 // ─────────────────────────────────────────────────────────────────────────────
 // Step 3 — planlegg 3 annonse-varianter (§ D)
 // Fast minimalistisk template (matcher Maarud/Nasjonalarkivet/CAPUS-samples).
-// Variasjon: ulikt foto per ad, og evt. liten undertittel-variasjon.
+// Variasjon: ulikt foto per ad. Undertittel er deterministisk (Ansettelsestype
+// + evt. Lokasjon) — alle 3 deler samme undertittel.
 // ─────────────────────────────────────────────────────────────────────────────
 const AD_COUNT = 1; // testmodus — sett tilbake til 3 etter at scraping-piping er bekreftet
 
-async function planThreeAds({ job, cust, assets, checklist }) {
+// SPEC v3 §e — Ansettelsestype alltid med, Lokasjon hvis satt.
+function deriveUndertittel({ type, sted }) {
+  if (type && sted) return `${type} · ${sted}`;
+  if (type) return type;
+  if (sted) return sted;
+  return '';
+}
+
+async function planThreeAds({ job, cust, assets, checklist, researchContext = null }) {
   const bildeKatalog = assets.brukbareEkteBilder.length === 0
     ? '  (ingen brukbare ekte bilder — alle 3 må generere realistisk arbeidsplass-foto)'
     : assets.brukbareEkteBilder.map((b, i) =>
@@ -676,6 +757,14 @@ async function planThreeAds({ job, cust, assets, checklist }) {
     'Hovedtittelen er stillingstittel — endre den ikke. Korrekt å og ø overalt. ' +
     'Svar KUN med rå JSON-array, ingen markdown, ingen forklaring.';
 
+  const researchBlock = researchContext
+    ? `\nFIRMA-KONTEKST (fra web-søk — beriker, overstyrer ALDRI det kunden har lagt inn):\n` +
+      `  Bransje: ${researchContext.bransje}\n` +
+      `  Hva de gjør: ${researchContext.hva_de_gjør}\n` +
+      `  Målgruppe: ${researchContext.målgruppe}\n` +
+      `  Tone: ${researchContext.tone}\n`
+    : '';
+
   const user =
     `MERKE: ${cust.merke}\n` +
     `FARGER: ${fargerLinje}\n` +
@@ -686,6 +775,7 @@ async function planThreeAds({ job, cust, assets, checklist }) {
     `LOKASJON: ${job.sted || '(ikke satt)'}\n` +
     `VINKEL: ${job.vinkel || '(ikke satt)'}\n` +
     `BESKRIVELSE: ${job.beskrivelse || '(ikke satt)'}\n` +
+    researchBlock +
     `\n` +
     `BRUKBARE EKTE BILDER (referer med bilde_indeks):\n${bildeKatalog}\n` +
     `\n` +
@@ -693,9 +783,8 @@ async function planThreeAds({ job, cust, assets, checklist }) {
     `\n` +
     `REGLER:\n` +
     `- "hovedtittel" SKAL være stillingstittel uendret: "${job.tittel}".\n` +
-    `- "undertittel" er valgfri (kort linje under tittel, f.eks. ansettelsestype + lokasjon, ` +
-    `vinkel kort uttrykt, eller tom). Maks 40 tegn. Hold den menneskelig og konkret — ` +
-    `unngå floskler.\n` +
+    `- "undertittel" settes deterministisk i koden ETTERPÅ — du kan returnere ` +
+    `tom streng her; den blir uansett overstyrt med "${deriveUndertittel(job) || '(tom)'}".\n` +
     `- Foretrekk ekte bilder. Hvis det finnes ${AD_COUNT} eller flere brukbare bilder, ` +
     `bruk ULIKT bilde per variant. Hvis færre finnes, kan flere varianter dele bilde — ` +
     `da må undertittelen variere for å gi visuell forskjell.\n` +
@@ -728,9 +817,10 @@ async function planThreeAds({ job, cust, assets, checklist }) {
   }
   // Valider bilde-indeks og normaliser feltnavn
   const maxIndex = Math.max(0, assets.brukbareEkteBilder.length - 1);
+  const fellesUndertittel = deriveUndertittel(job); // SPEC v3 §e — alle 3 deler samme
   for (const v of variants) {
     v.hovedtittel = v.hovedtittel || job.tittel;
-    v.undertittel = (v.undertittel || '').trim();
+    v.undertittel = fellesUndertittel; // overstyrer Claude
     if (!v.bilde || typeof v.bilde !== 'object') {
       v.bilde = { mode: 'generer', bilde_indeks: null, generer_beskrivelse: 'realistisk arbeidsplass-scene' };
     }
@@ -979,21 +1069,30 @@ async function main() {
   console.log(`→ ${cust.merke}: ${job.tittel} (${job.type} · ${job.sted})`);
   console.log(`   Branding-kilde: ${cust.kilde}`);
 
-  // Nettsted-skraping for fallback-branding
-  let scraped = null;
-  if (job.nettsted) {
-    console.log(`→ Skraper nettsted: ${job.nettsted}...`);
-    scraped = await scrapeWebsiteAssets(job.nettsted);
-    if (scraped?.feil) {
-      console.log(`   ⚠ skraping feilet: ${scraped.feil}`);
-    } else if (scraped) {
-      console.log(`   ${scraped.colors.length} farge(r), ${scraped.images.length} content-bilde(r), logo: ${scraped.logoFile ? 'ja' : 'nei'}${scraped.font ? `, font: ${scraped.font}` : ''}`);
-      if (scraped.debug) {
-        const d = scraped.debug;
-        console.log(`   [debug] kandidater: logo=${d.logoKandidater}, content=${d.contentKandidater}, prøvd=${d.prøvd}, forSmaa=${d.forSmaa}, feilet=${d.feilet}`);
-      }
+  // Nettsted-skraping + research-søk i parallel
+  if (job.nettsted) console.log(`→ Skraper nettsted: ${job.nettsted}...`);
+  if (job.dittFirma) console.log(`→ Web-research på "${job.dittFirma}"...`);
+  const [scraped, research] = await Promise.all([
+    job.nettsted ? scrapeWebsiteAssets(job.nettsted) : Promise.resolve(null),
+    job.dittFirma ? researchCompany({ navn: job.dittFirma, nettsted: job.nettsted, sted: job.sted }) : Promise.resolve(null),
+  ]);
+  if (scraped?.feil) {
+    console.log(`   ⚠ skraping feilet: ${scraped.feil}`);
+  } else if (scraped) {
+    console.log(`   ${scraped.colors.length} farge(r), ${scraped.images.length} content-bilde(r), logo: ${scraped.logoFile ? 'ja' : 'nei'}${scraped.font ? `, font: ${scraped.font}` : ''}`);
+    if (scraped.debug) {
+      const d = scraped.debug;
+      console.log(`   [debug] kandidater: logo=${d.logoKandidater}, content=${d.contentKandidater}, prøvd=${d.prøvd}, forSmaa=${d.forSmaa}, feilet=${d.feilet}`);
     }
   }
+  if (research?.feil) {
+    console.log(`   ⚠ research feilet: ${research.feil}`);
+  } else if (research?.ignored) {
+    console.log(`   ⚠ research ignorert (sikkerhet=lav)`);
+  } else if (research) {
+    console.log(`   ${research.bransje}: ${research.hva_de_gjør} | tone: ${research.tone}`);
+  }
+  const researchContext = research && !research.feil && !research.ignored ? research : null;
 
   resolveBranding({ cust, job, scraped });
   console.log(`   Fargekilde: ${cust.fargerKilde} (${cust.alle.length} hex)`);
@@ -1027,7 +1126,7 @@ async function main() {
   console.log(`   Regler: ansettelsestype i ≥${checklist.regler.ansettelsestypeMinstAntall}, lokasjon i ≥${checklist.regler.lokasjonMinstAntall}, farger=${checklist.regler.fargerIAlle}, logo=${checklist.regler.logoIAlle}, ekte-bilde-prioritet=${checklist.regler.foretrekkEkteBildeOverGenerering}`);
 
   console.log(`→ Planlegger ${AD_COUNT} annonse-varianter med Claude...`);
-  const variants = await planThreeAds({ job, cust, assets, checklist });
+  const variants = await planThreeAds({ job, cust, assets, checklist, researchContext });
   variants.forEach((v, i) => {
     const visual = v.bilde?.mode === 'bruk_bilde' ? `bilde[${v.bilde.bilde_indeks}]` : 'generer';
     const sub = v.undertittel ? ` "${v.undertittel}"` : '';
