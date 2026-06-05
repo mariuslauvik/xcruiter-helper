@@ -733,16 +733,21 @@ async function analyzeAssets({ job, cust, scrapedImages = [], scrapedLogoCandida
     null;
 
   // Siste fallback: hvis ingen logo funnet, kjør verifyLogoMatch på jobb-bilder.
-  // Den generelle vision-analysen er content-fokusert og kan misse at et
-  // jobb-uploadet bilde er logoen. Denne stiller spørsmålet direkte.
+  // Brukeren har eksplisitt lastet opp bildet — vi stoler på dem. Hvis vision
+  // sier "ja, dette er en logo" (uansett om navn-match), brukes det. Strengere
+  // navn-match-krav er forbeholdt scraped-kandidater hvor vi ikke vet hva vi får.
   if (!logoFil && merke) {
     const jobbBilder = analyserte.filter((r) => r.source === 'jobb' && !r.feil && r.buffer);
+    console.log(`   Fallback: vurderer ${jobbBilder.length} jobb-bilde(r) som mulig logo...`);
     for (const j of jobbBilder) {
       const verified = await verifyLogoMatch({
         buffer: j.buffer, mediaType: j.mediaType, url: j.url, merke,
       });
-      if (verified.analyse?.match) {
-        logoFil = { ...verified, source: 'jobb-uploadet-logo' };
+      const erLogo = verified.analyse?.type === 'logo';
+      const navnMatch = verified.analyse?.match === true;
+      console.log(`     • jobb-bilde: er_logo=${erLogo}, navn_match=${navnMatch}, tekst="${verified.analyse?.tekst || ''}"`);
+      if (erLogo) {
+        logoFil = { ...verified, source: navnMatch ? 'jobb-uploadet-logo (navn-bekreftet)' : 'jobb-uploadet-logo (brukertrust)' };
         // Fjern fra brukbareEkteBilder så det ikke også brukes som hovedbilde
         const idx = brukbareEkteBilder.findIndex((b) => b.url === j.url);
         if (idx >= 0) brukbareEkteBilder.splice(idx, 1);
